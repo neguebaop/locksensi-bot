@@ -1,4 +1,4 @@
-import os, asyncio, json, io, random, string, traceback, re
+import os, asyncio, json, io, random, string, traceback, re, urllib.request, urllib.error
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -19,7 +19,12 @@ app = Flask("")
 
 @app.route("/")
 def home():
-    return "Bot online!"
+    try:
+        if "bot" in globals() and bot.is_ready():
+            return f"Bot online! Discord conectado como {bot.user}", 200
+    except Exception:
+        pass
+    return "Servidor web online. Discord ainda conectando...", 200
 
 
 @app.route("/webhooks/misticpay/<token>", methods=["POST"])
@@ -45,12 +50,13 @@ def run_web():
 
 
 def keep_alive():
-    t = Thread(target=run_web)
+    # Se o Discord falhar, o Flask não mantém o processo falsamente "Live".
+    t = Thread(target=run_web, daemon=True, name="LockSensi-Web")
     t.start()
 
 
 load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
 PIX_KEY = os.getenv("PIX_KEY", "")
 PIX_NOME = os.getenv("PIX_NOME", "LOJA")[:25]
 PIX_CIDADE = os.getenv("PIX_CIDADE", "SAO PAULO")[:15]
@@ -1710,5 +1716,79 @@ if not getattr(app, "_verification_routes", False):
     verification_system.register_routes(app)
     app._verification_routes = True
 
+def discord_preflight():
+    """Valida token/rede sem imprimir nem salvar o token."""
+    print("[STARTUP] Iniciando diagnóstico do Discord...", flush=True)
+    print(
+        "[STARTUP] DISCORD_TOKEN carregado:",
+        "SIM" if bool(TOKEN) else "NAO",
+        flush=True,
+    )
+
+    if not TOKEN:
+        raise RuntimeError("DISCORD_TOKEN não foi carregado.")
+
+    req = urllib.request.Request(
+        "https://discord.com/api/v10/users/@me",
+        headers={
+            "Authorization": "Bot " + TOKEN,
+            "User-Agent": "LockSensiBot/Render",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            data = json.loads(raw)
+            print(
+                "[STARTUP] Token aceito pelo Discord:",
+                f"{data.get('username', 'bot')} ({data.get('id', '?')})",
+                flush=True,
+            )
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            print(
+                "[FATAL] DISCORD_TOKEN inválido/revogado no Render.",
+                flush=True,
+            )
+            raise RuntimeError("DISCORD_TOKEN inválido (HTTP 401).")
+        raise
+    except Exception as exc:
+        print(
+            "[FATAL] Falha ao acessar API do Discord:",
+            type(exc).__name__,
+            str(exc),
+            flush=True,
+        )
+        raise
+
+
+discord_preflight()
 keep_alive()
-bot.run(TOKEN)
+print("[STARTUP] Abrindo conexão com o Discord Gateway...", flush=True)
+
+try:
+    bot.run(TOKEN)
+except discord.LoginFailure:
+    print(
+        "[FATAL] Discord recusou o token. Revise DISCORD_TOKEN no Render.",
+        flush=True,
+    )
+    raise
+except discord.PrivilegedIntentsRequired:
+    print(
+        "[FATAL] Privileged Intents desabilitadas. "
+        "Ative SERVER MEMBERS INTENT e MESSAGE CONTENT INTENT no Developer Portal.",
+        flush=True,
+    )
+    raise
+except Exception as exc:
+    print(
+        "[FATAL] Bot Discord encerrou:",
+        type(exc).__name__,
+        str(exc),
+        flush=True,
+    )
+    traceback.print_exc()
+    raise
