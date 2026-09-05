@@ -1,4 +1,4 @@
-import os, asyncio, json, io, random, string, traceback, re, urllib.request, urllib.error
+import os, asyncio, json, io, random, string, traceback, re
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -1716,57 +1716,12 @@ if not getattr(app, "_verification_routes", False):
     verification_system.register_routes(app)
     app._verification_routes = True
 
-def discord_preflight():
-    """Valida token/rede sem imprimir nem salvar o token."""
-    print("[STARTUP] Iniciando diagnóstico do Discord...", flush=True)
-    print(
-        "[STARTUP] DISCORD_TOKEN carregado:",
-        "SIM" if bool(TOKEN) else "NAO",
-        flush=True,
-    )
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN não foi carregado no Render.")
 
-    if not TOKEN:
-        raise RuntimeError("DISCORD_TOKEN não foi carregado.")
-
-    req = urllib.request.Request(
-        "https://discord.com/api/v10/users/@me",
-        headers={
-            "Authorization": "Bot " + TOKEN,
-            "User-Agent": "LockSensiBot/Render",
-        },
-        method="GET",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode("utf-8", "replace")
-            data = json.loads(raw)
-            print(
-                "[STARTUP] Token aceito pelo Discord:",
-                f"{data.get('username', 'bot')} ({data.get('id', '?')})",
-                flush=True,
-            )
-    except urllib.error.HTTPError as exc:
-        if exc.code == 401:
-            print(
-                "[FATAL] DISCORD_TOKEN inválido/revogado no Render.",
-                flush=True,
-            )
-            raise RuntimeError("DISCORD_TOKEN inválido (HTTP 401).")
-        raise
-    except Exception as exc:
-        print(
-            "[FATAL] Falha ao acessar API do Discord:",
-            type(exc).__name__,
-            str(exc),
-            flush=True,
-        )
-        raise
-
-
-discord_preflight()
+print("[STARTUP] DISCORD_TOKEN carregado: SIM", flush=True)
 keep_alive()
-print("[STARTUP] Abrindo conexão com o Discord Gateway...", flush=True)
+print("[STARTUP] Conectando ao Discord com discord.py...", flush=True)
 
 try:
     bot.run(TOKEN)
@@ -1783,6 +1738,14 @@ except discord.PrivilegedIntentsRequired:
         flush=True,
     )
     raise
+except discord.HTTPException as exc:
+    print(
+        "[FATAL] Erro HTTP do Discord:",
+        getattr(exc, "status", "?"),
+        str(exc),
+        flush=True,
+    )
+    raise
 except Exception as exc:
     print(
         "[FATAL] Bot Discord encerrou:",
@@ -1792,3 +1755,4 @@ except Exception as exc:
     )
     traceback.print_exc()
     raise
+
