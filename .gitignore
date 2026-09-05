@@ -1,0 +1,13 @@
+.env
+.env.*
+.replit
+.local/
+.venv/
+venv/
+__pycache__/
+*.pyc
+vendas.db
+*.db-wal
+*.db-shm
+BACKUP_SUPABASE/
+LOCKSENSI_BOT_BACKUP_*.zip
