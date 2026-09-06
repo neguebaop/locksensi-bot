@@ -687,6 +687,21 @@ def ensure_split_schema():
             )
             """
         )
+        # V4: regra vinculada ao PAINEL de vendas, e não ao texto do produto.
+        # As colunas são opcionais para preservar regras antigas por nome-base.
+        con._conn.execute(
+            "ALTER TABLE split_group_rules ADD COLUMN IF NOT EXISTS panel_id BIGINT"
+        )
+        con._conn.execute(
+            "ALTER TABLE split_group_rules ADD COLUMN IF NOT EXISTS panel_name TEXT"
+        )
+        con._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_split_group_rules_panel
+            ON split_group_rules(guild_id, panel_id)
+            WHERE panel_id IS NOT NULL
+            """
+        )
 
         # ID VISÍVEL/LOCAL por servidor.
         # O products.id continua sendo a chave global interna do banco, mas os
@@ -829,10 +844,132 @@ def validate_split_email(value):
 def normalize_split_group(value):
     value = re.sub(r"\s+", " ", str(value or "")).strip().lower()
     if len(value) < 3:
-        raise ValueError("Use pelo menos 3 caracteres no nome-base do grupo.")
-    if len(value) > 80:
-        raise ValueError("O nome-base do grupo é muito grande.")
+        raise ValueError("Use pelo menos 3 caracteres.")
+    if len(value) > 100:
+        raise ValueError("O nome é muito grande.")
     return value
+
+
+def normalize_panel_label(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+
+def panel_display_name(row):
+    title = str(_row_value(row, "title", "") or "").strip()
+    name = str(_row_value(row, "name", "") or "").strip()
+    return title or name or f"Painel #{_row_value(row, 'id', '?')}"
+
+
+def get_split_panels(guild_id, search=None, limit=100):
+    """
+    Lista painéis reais criados no bot.
+    O nome exibido é o mesmo usado no embed: title, com fallback para name.
+    """
+    con = db()
+    try:
+        rows = con.execute(
+            """
+            SELECT id,guild_id,name,title
+            FROM panels
+            WHERE guild_id=?
+            ORDER BY COALESCE(NULLIF(title,''),name) ASC,id ASC
+            """,
+            (int(guild_id),),
+        ).fetchall()
+    finally:
+        con.close()
+
+    current = normalize_panel_label(search)
+    if current:
+        rows = [
+            row for row in rows
+            if current in normalize_panel_label(panel_display_name(row))
+            or current in normalize_panel_label(_row_value(row, "name", ""))
+        ]
+    return rows[: max(1, int(limit or 100))]
+
+
+def resolve_split_panel(guild_id, value):
+    """
+    Resolve pelo NOME QUE APARECE NO PAINEL.
+    Ex.: "Estabilizador Emulador".
+    """
+    wanted = normalize_panel_label(value)
+    if not wanted:
+        return None
+
+    rows = get_split_panels(guild_id, limit=500)
+
+    # Primeiro: correspondência exata com título visível ou nome interno.
+    exact = [
+        row for row in rows
+        if normalize_panel_label(panel_display_name(row)) == wanted
+        or normalize_panel_label(_row_value(row, "name", "")) == wanted
+    ]
+    if exact:
+        # Se houver duplicado antigo, o mais recente vence.
+        return sorted(exact, key=lambda r: int(_row_value(r, "id", 0) or 0), reverse=True)[0]
+
+    # Depois: aceita um único resultado parcial para facilitar digitação.
+    partial = [
+        row for row in rows
+        if wanted in normalize_panel_label(panel_display_name(row))
+        or wanted in normalize_panel_label(_row_value(row, "name", ""))
+    ]
+    if len(partial) == 1:
+        return partial[0]
+
+    return None
+
+
+def get_panel_products(guild_id, panel_id, active_only=False):
+    con = db()
+    try:
+        query = """
+            SELECT p.*
+            FROM products p
+            JOIN panel_products pp ON pp.product_id=p.id
+            JOIN panels pn ON pn.id=pp.panel_id
+            WHERE pp.panel_id=? AND pn.guild_id=? AND p.guild_id=?
+        """
+        args = [int(panel_id), int(guild_id), int(guild_id)]
+        if active_only:
+            query += " AND p.active=1"
+        query += " ORDER BY p.local_id ASC,p.id ASC"
+        return con.execute(query, tuple(args)).fetchall()
+    finally:
+        con.close()
+
+
+async def split_panel_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+):
+    """Autocomplete mostra PAINÉIS, não a lista global de produtos."""
+    if not interaction.guild_id:
+        return []
+    try:
+        rows = get_split_panels(interaction.guild_id, current, limit=25)
+    except Exception:
+        return []
+
+    choices = []
+    seen = set()
+    for row in rows:
+        label = panel_display_name(row)
+        key = normalize_panel_label(label)
+        if not label or key in seen:
+            continue
+        seen.add(key)
+        choices.append(
+            app_commands.Choice(
+                name=label[:100],
+                value=label[:100],
+            )
+        )
+        if len(choices) >= 25:
+            break
+    return choices
 
 
 def mask_split_email(value):
@@ -848,10 +985,13 @@ def get_split_group_rules(guild_id):
     try:
         return con.execute(
             """
-            SELECT id,guild_id,match_text,split_user,split_tax,active
+            SELECT id,guild_id,match_text,split_user,split_tax,active,
+                   panel_id,panel_name
             FROM split_group_rules
             WHERE guild_id=? AND active=1
-            ORDER BY LENGTH(match_text) DESC,id DESC
+            ORDER BY
+                CASE WHEN panel_id IS NOT NULL THEN 0 ELSE 1 END,
+                id DESC
             """,
             (int(guild_id),),
         ).fetchall()
@@ -859,16 +999,90 @@ def get_split_group_rules(guild_id):
         con.close()
 
 
+def find_panel_split_group(product):
+    """
+    Regra nova V4:
+    produto herda o split do PAINEL ao qual ele foi ligado em panel_products.
+    Assim Mensal / 90 Dias / Permanente recebem a mesma divisão mesmo tendo
+    nomes de produto totalmente diferentes.
+    """
+    if not product:
+        return None
+
+    guild_id = int(_row_value(product, "guild_id", 0) or 0)
+    product_id = int(_row_value(product, "id", 0) or 0)
+    if not guild_id or not product_id:
+        return None
+
+    con = db()
+    try:
+        row = con.execute(
+            """
+            SELECT sgr.id,sgr.split_user,sgr.split_tax,
+                   sgr.panel_id,sgr.panel_name,
+                   pn.name AS real_panel_name,
+                   pn.title AS real_panel_title
+            FROM split_group_rules sgr
+            JOIN panel_products pp ON pp.panel_id=sgr.panel_id
+            LEFT JOIN panels pn ON pn.id=sgr.panel_id
+            WHERE sgr.guild_id=?
+              AND sgr.active=1
+              AND sgr.panel_id IS NOT NULL
+              AND pp.product_id=?
+            ORDER BY sgr.id DESC
+            LIMIT 1
+            """,
+            (guild_id, product_id),
+        ).fetchone()
+    finally:
+        con.close()
+
+    if not row:
+        return None
+
+    split_user = validate_split_email(_row_value(row, "split_user", ""))
+    split_tax = round(float(_row_value(row, "split_tax", 0) or 0), 2)
+    if split_tax <= 0 or split_tax >= 100:
+        return None
+
+    display = (
+        str(_row_value(row, "panel_name", "") or "").strip()
+        or str(_row_value(row, "real_panel_title", "") or "").strip()
+        or str(_row_value(row, "real_panel_name", "") or "").strip()
+        or f"Painel #{_row_value(row, 'panel_id', '?')}"
+    )
+
+    return {
+        "user": split_user,
+        "tax": split_tax,
+        "source": "painel",
+        "group": display,
+        "panel_id": int(_row_value(row, "panel_id", 0) or 0),
+    }
+
+
 def find_matching_split_group(product):
     if not product:
         return None
+
+    # V4: painel real tem prioridade sobre as regras antigas por texto.
+    panel_rule = find_panel_split_group(product)
+    if panel_rule:
+        return panel_rule
+
+    # Compatibilidade: regras antigas por nome-base continuam funcionando.
     guild_id = int(_row_value(product, "guild_id", 0) or 0)
     product_name = str(_row_value(product, "name", "") or "").strip().lower()
     if not guild_id or not product_name:
         return None
 
     for row in get_split_group_rules(guild_id):
-        match_text = normalize_split_group(_row_value(row, "match_text", ""))
+        if _row_value(row, "panel_id", None) is not None:
+            continue
+        match_raw = str(_row_value(row, "match_text", "") or "")
+        if not match_raw:
+            continue
+        match_text = normalize_split_group(match_raw)
         if match_text in product_name:
             split_user = validate_split_email(_row_value(row, "split_user", ""))
             split_tax = round(float(_row_value(row, "split_tax", 0) or 0), 2)
@@ -884,14 +1098,14 @@ def find_matching_split_group(product):
 
 
 def get_product_split(product):
-    """Split efetivo: configuração individual > grupo pelo nome > sem split."""
+    """Prioridade: split individual > painel real > grupo legado por nome > sem split."""
     if not product:
         return None
 
     enabled = int(_row_value(product, "split_enabled", 0) or 0) == 1
     override = int(_row_value(product, "split_override", 0) or 0) == 1
 
-    # Compatibilidade total com o sistema antigo por ID.
+    # Sistema antigo por ID continua funcionando e tem prioridade.
     if enabled:
         split_user = validate_split_email(_row_value(product, "split_user", ""))
         split_tax = round(float(_row_value(product, "split_tax", 0) or 0), 2)
@@ -906,7 +1120,7 @@ def get_product_split(product):
             "group": None,
         }
 
-    # Produto explicitamente desligado não herda grupos.
+    # Bloqueio individual explícito impede herança de painel/grupo.
     if override:
         return None
 
@@ -4195,11 +4409,12 @@ class CheckoutCommands(app_commands.Group):
             )
             return
 
-        source_text = (
-            f"Grupo `{split.get('group')}`"
-            if split.get("source") == "grupo"
-            else "Configuração individual do produto"
-        )
+        if split.get("source") == "painel":
+            source_text = f"Painel `{split.get('group')}`"
+        elif split.get("source") == "grupo":
+            source_text = f"Grupo legado `{split.get('group')}`"
+        else:
+            source_text = "Configuração individual do produto"
         await i.response.send_message(
             f"📦 **{product['name']}** (`#{produto_id}`)\n"
             "🤝 Split efetivo: **ATIVADO**\n"
@@ -4211,7 +4426,7 @@ class CheckoutCommands(app_commands.Group):
 
     @app_commands.command(
         name="splits",
-        description="Lista splits por grupo e overrides individuais",
+        description="Lista splits por painel, grupo legado e produto individual",
     )
     async def splits_list(self, i: discord.Interaction):
         if ADMIN_CHECK and not await ADMIN_CHECK(i):
@@ -4225,17 +4440,17 @@ class CheckoutCommands(app_commands.Group):
                 FROM products
                 WHERE guild_id=? AND split_enabled=1
                 ORDER BY local_id ASC
-                LIMIT 40
+                LIMIT 60
                 """,
                 (i.guild.id,),
             ).fetchall()
             groups = con.execute(
                 """
-                SELECT match_text,split_user,split_tax
+                SELECT match_text,split_user,split_tax,panel_id,panel_name
                 FROM split_group_rules
                 WHERE guild_id=? AND active=1
-                ORDER BY LENGTH(match_text) DESC,match_text ASC
-                LIMIT 30
+                ORDER BY id DESC
+                LIMIT 60
                 """,
                 (i.guild.id,),
             ).fetchall()
@@ -4244,21 +4459,38 @@ class CheckoutCommands(app_commands.Group):
 
         if not rows and not groups:
             await i.response.send_message(
-                "🤝 Nenhum split individual ou de grupo ativo.",
+                "🤝 Nenhum split ativo.",
                 ephemeral=True,
             )
             return
 
         sections = []
-        if groups:
-            lines = []
-            for row in groups:
-                tax = float(row["split_tax"] or 0)
-                lines.append(
-                    f"🧩 `{row['match_text']}` • "
-                    f"{100 - tax:g}% principal / {tax:g}% `{row['split_user']}`"
+
+        panel_lines = []
+        legacy_lines = []
+        for row in groups:
+            tax = float(row["split_tax"] or 0)
+            panel_id = _row_value(row, "panel_id", None)
+            if panel_id is not None:
+                pname = str(_row_value(row, "panel_name", "") or f"Painel #{panel_id}")
+                try:
+                    count = len(get_panel_products(i.guild.id, int(panel_id)))
+                except Exception:
+                    count = 0
+                panel_lines.append(
+                    f"🖼️ **{pname}** • {count} opção(ões) • "
+                    f"{100 - tax:g}% / {tax:g}% `{row['split_user']}`"
                 )
-            sections.append("**Grupos automáticos**\n" + "\n".join(lines))
+            else:
+                legacy_lines.append(
+                    f"🧩 `{row['match_text']}` • "
+                    f"{100 - tax:g}% / {tax:g}% `{row['split_user']}`"
+                )
+
+        if panel_lines:
+            sections.append("**Splits por painel**\n" + "\n".join(panel_lines))
+        if legacy_lines:
+            sections.append("**Grupos antigos por nome-base**\n" + "\n".join(legacy_lines))
 
         if rows:
             lines = []
@@ -4266,7 +4498,7 @@ class CheckoutCommands(app_commands.Group):
                 tax = float(row["split_tax"] or 0)
                 lines.append(
                     f"📦 `#{row['local_id']}` • **{row['name']}** • "
-                    f"{100 - tax:g}% principal / {tax:g}% `{row['split_user']}`"
+                    f"{100 - tax:g}% / {tax:g}% `{row['split_user']}`"
                 )
             sections.append("**Overrides individuais**\n" + "\n".join(lines))
 
@@ -4281,14 +4513,15 @@ class CheckoutCommands(app_commands.Group):
 
     @app_commands.command(
         name="split-grupo",
-        description="Ativa split em todas as opções com o mesmo nome-base",
+        description="Ativa split em todas as opções de um painel de vendas",
     )
     @app_commands.describe(
-        nome="Nome-base comum. Ex: Lock Sensi Pro ou Estabilizador",
+        nome="Nome que aparece no painel. Ex: Estabilizador Emulador",
         email="E-mail MisticPay que recebe a porcentagem",
-        porcentagem="Porcentagem enviada à outra conta. Ex: 50",
-        forcar="True = grupo passa a controlar inclusive produtos com override individual",
+        porcentagem="Porcentagem enviada à outra conta. Padrão: 50",
+        forcar="True = remove overrides individuais das opções deste painel",
     )
+    @app_commands.autocomplete(nome=split_panel_autocomplete)
     async def split_group_configure(
         self,
         i: discord.Interaction,
@@ -4301,7 +4534,6 @@ class CheckoutCommands(app_commands.Group):
             return
 
         try:
-            match_text = normalize_split_group(nome)
             split_user = validate_split_email(email)
         except ValueError as exc:
             await i.response.send_message(f"❌ {exc}", ephemeral=True)
@@ -4315,117 +4547,164 @@ class CheckoutCommands(app_commands.Group):
             )
             return
 
+        panel = resolve_split_panel(i.guild.id, nome)
+        if not panel:
+            suggestions = get_split_panels(i.guild.id, nome, limit=10)
+            if not suggestions:
+                suggestions = get_split_panels(i.guild.id, limit=10)
+            list_text = "\n".join(
+                f"• `{panel_display_name(row)}`"
+                for row in suggestions
+            ) or "Nenhum painel encontrado."
+            await i.response.send_message(
+                "❌ **Painel não encontrado.**\n\n"
+                "Use exatamente o nome que aparece no topo do painel de vendas.\n\n"
+                f"**Painéis encontrados:**\n{list_text}",
+                ephemeral=True,
+            )
+            return
+
+        panel_id = int(panel["id"])
+        panel_name = panel_display_name(panel)
+        matches = get_panel_products(i.guild.id, panel_id)
+
+        if not matches:
+            await i.response.send_message(
+                f"❌ O painel **{panel_name}** existe, mas não tem produtos/opções vinculados.",
+                ephemeral=True,
+            )
+            return
+
         con = db()
         try:
-            matches = con.execute(
-                """
-                SELECT id,local_id,name,split_override,split_enabled
-                FROM products
-                WHERE guild_id=? AND LOWER(name) LIKE ?
-                ORDER BY local_id ASC
-                """,
-                (i.guild.id, f"%{match_text}%"),
-            ).fetchall()
-            if not matches:
-                await i.response.send_message(
-                    f"❌ Nenhum produto contém `{match_text}` no nome. "
-                    "Use `/loja produtos` para conferir os nomes.",
-                    ephemeral=True,
-                )
-                return
-            if len(matches) > 40:
-                await i.response.send_message(
-                    f"❌ `{match_text}` encontrou {len(matches)} produtos. "
-                    "Use um nome-base mais específico.",
-                    ephemeral=True,
-                )
-                return
-
             now = now_iso()
+            rule_key = f"panel:{panel_id}"
             con.execute(
                 """
                 INSERT INTO split_group_rules(
-                    guild_id,match_text,split_user,split_tax,active,created_at,updated_at
-                ) VALUES(?,?,?,?,1,?,?)
+                    guild_id,match_text,split_user,split_tax,active,
+                    created_at,updated_at,panel_id,panel_name
+                ) VALUES(?,?,?,?,1,?,?,?,?)
                 ON CONFLICT(guild_id,match_text) DO UPDATE SET
                     split_user=excluded.split_user,
                     split_tax=excluded.split_tax,
                     active=1,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    panel_id=excluded.panel_id,
+                    panel_name=excluded.panel_name
                 """,
-                (i.guild.id, match_text, split_user, porcentagem, now, now),
+                (
+                    i.guild.id,
+                    rule_key,
+                    split_user,
+                    porcentagem,
+                    now,
+                    now,
+                    panel_id,
+                    panel_name,
+                ),
             )
+
             if forcar:
+                product_ids = [int(row["id"]) for row in matches]
+                placeholders = ",".join("?" for _ in product_ids)
                 con.execute(
-                    """
+                    f"""
                     UPDATE products
                     SET split_enabled=0,split_user=NULL,split_tax=0,split_override=0
-                    WHERE guild_id=? AND LOWER(name) LIKE ?
+                    WHERE guild_id=? AND id IN ({placeholders})
                     """,
-                    (i.guild.id, f"%{match_text}%"),
+                    tuple([i.guild.id] + product_ids),
                 )
             con.commit()
         finally:
             con.close()
 
-        overridden = 0
         lines = []
+        overridden = 0
         for row in matches:
             override = int(_row_value(row, "split_override", 0) or 0) == 1
-            if override and not forcar:
+            enabled = int(_row_value(row, "split_enabled", 0) or 0) == 1
+            if (override or enabled) and not forcar:
                 overridden += 1
-                mark = "⚠️ override individual preservado"
+                mark = "⚠️ split individual preservado"
             else:
-                mark = "✅ controlado pelo grupo"
-            lines.append(f"`#{row['local_id']}` • {row['name']} • {mark}")
+                mark = "✅ herda o painel"
+            lines.append(
+                f"`#{row['local_id']}` • **{row['name']}** • {mark}"
+            )
 
         warning = ""
         if overridden:
             warning = (
-                f"\n\n⚠️ {overridden} produto(s) já tinham regra individual. "
-                "Use `forcar:True` para o grupo controlar todos."
+                f"\n\n⚠️ **{overridden} opção(ões)** já têm regra individual. "
+                "Use `forcar:True` se quiser que o painel controle essas opções também."
             )
 
         await i.response.send_message(
-            "✅ **Split de grupo configurado.**\n\n"
-            f"🧩 Nome-base: `{match_text}`\n"
+            "✅ **Split do painel configurado.**\n\n"
+            f"🖼️ Painel: **{panel_name}**\n"
+            f"📦 Opções vinculadas: **{len(matches)}**\n"
             f"🏦 Principal: **{100 - porcentagem:g}%**\n"
             f"🤝 `{split_user}`: **{porcentagem:g}%**\n\n"
-            "**Opções encontradas:**\n"
+            "**Todas as opções deste painel:**\n"
             + "\n".join(lines)[:2600]
             + warning
-            + "\n\nNovas opções com esse mesmo texto no nome também herdam o split automaticamente.",
+            + "\n\n💡 Se você adicionar outro produto a esse painel depois, "
+              "ele também herda o split automaticamente.",
             ephemeral=True,
         )
 
     @app_commands.command(
         name="split-grupo-remover",
-        description="Remove uma regra de split por nome-base",
+        description="Remove o split automático de um painel",
     )
-    @app_commands.describe(nome="Mesmo nome-base usado em /loja split-grupo")
+    @app_commands.describe(nome="Nome do painel usado em /loja split-grupo")
+    @app_commands.autocomplete(nome=split_panel_autocomplete)
     async def split_group_remove(self, i: discord.Interaction, nome: str):
         if ADMIN_CHECK and not await ADMIN_CHECK(i):
             return
-        try:
-            match_text = normalize_split_group(nome)
-        except ValueError as exc:
-            await i.response.send_message(f"❌ {exc}", ephemeral=True)
-            return
+
+        panel = resolve_split_panel(i.guild.id, nome)
         con = db()
         try:
-            cur = con.execute(
-                "DELETE FROM split_group_rules WHERE guild_id=? AND match_text=?",
-                (i.guild.id, match_text),
-            )
+            removed = 0
+            if panel:
+                panel_id = int(panel["id"])
+                cur = con.execute(
+                    """
+                    DELETE FROM split_group_rules
+                    WHERE guild_id=? AND panel_id=?
+                    """,
+                    (i.guild.id, panel_id),
+                )
+                removed = int(getattr(cur, "rowcount", 0) or 0)
+                label = panel_display_name(panel)
+            else:
+                # Compatibilidade para remover uma regra antiga por nome-base.
+                try:
+                    match_text = normalize_split_group(nome)
+                except ValueError:
+                    match_text = normalize_panel_label(nome)
+                cur = con.execute(
+                    """
+                    DELETE FROM split_group_rules
+                    WHERE guild_id=? AND panel_id IS NULL AND match_text=?
+                    """,
+                    (i.guild.id, match_text),
+                )
+                removed = int(getattr(cur, "rowcount", 0) or 0)
+                label = nome
             con.commit()
-            removed = int(getattr(cur, "rowcount", 0) or 0)
         finally:
             con.close()
+
         await i.response.send_message(
             (
-                f"✅ Grupo `{match_text}` removido. Splits individuais antigos foram preservados."
+                f"✅ Split automático de **{label}** removido. "
+                "Splits individuais antigos foram preservados."
                 if removed
-                else f"⚠️ Não existe grupo `{match_text}` neste servidor."
+                else f"⚠️ Não existe split automático para **{label}**."
             ),
             ephemeral=True,
         )
@@ -4469,7 +4748,12 @@ class CheckoutCommands(app_commands.Group):
         if err:
             effective = f"❌ Configuração inválida: `{err}`"
         elif split:
-            src = f"grupo `{split.get('group')}`" if split.get("source") == "grupo" else "produto individual"
+            if split.get("source") == "painel":
+                src = f"painel `{split.get('group')}`"
+            elif split.get("source") == "grupo":
+                src = f"grupo legado `{split.get('group')}`"
+            else:
+                src = "produto individual"
             effective = (
                 f"✅ **ATIVO** por {src}\n"
                 f"Principal: **{100 - split['tax']:g}%** • `{split['user']}`: **{split['tax']:g}%**"
@@ -4930,26 +5214,51 @@ class CheckoutCommands(app_commands.Group):
         await i.response.send_message(embed=e, ephemeral=True)
 
     @app_commands.command(
-        name="produtos", description="Lista produtos e IDs deste servidor"
+        name="produtos", description="Lista produtos por página, começando do ID #1"
     )
-    async def products(self, i: discord.Interaction):
+    @app_commands.describe(
+        pagina="Página da lista. Ex: 1, 2, 3..."
+    )
+    async def products(self, i: discord.Interaction, pagina: int = 1):
         if ADMIN_CHECK and not await ADMIN_CHECK(i):
             return
+
+        pagina = max(1, int(pagina or 1))
+        per_page = 25
+        offset = (pagina - 1) * per_page
+
         con = db()
-        rows = con.execute(
-            """
-            SELECT
-                id,local_id,name,price,stock,active,
-                license_enabled,purchase_role_id
-            FROM products
-            WHERE guild_id=?
-            ORDER BY local_id DESC
-            LIMIT 40
-            """,
-            (i.guild.id,),
-        ).fetchall()
-        con.close()
-        txt = (
+        try:
+            total_row = con.execute(
+                "SELECT COUNT(*) AS c FROM products WHERE guild_id=?",
+                (i.guild.id,),
+            ).fetchone()
+            total = int(total_row["c"] or 0)
+
+            rows = con.execute(
+                """
+                SELECT
+                    id,local_id,name,price,stock,active,
+                    license_enabled,purchase_role_id
+                FROM products
+                WHERE guild_id=?
+                ORDER BY local_id ASC
+                LIMIT ? OFFSET ?
+                """,
+                (i.guild.id, per_page, offset),
+            ).fetchall()
+        finally:
+            con.close()
+
+        pages = max(1, math.ceil(total / per_page)) if total else 1
+        if pagina > pages and total:
+            await i.response.send_message(
+                f"❌ Essa página não existe. Última página: **{pages}**.",
+                ephemeral=True,
+            )
+            return
+
+        body = (
             "\n".join(
                 (
                     f"`#{r['local_id']}` • **{r['name']}** • {money(r['price'])} • "
@@ -4961,9 +5270,12 @@ class CheckoutCommands(app_commands.Group):
             )
             or "Nenhum produto."
         )
+
         await i.response.send_message(
             embed=discord.Embed(
-                title="📦 Produtos", description=txt[:4000], color=0x8B2CF5
+                title=f"📦 Produtos • Página {pagina}/{pages}",
+                description=(body + f"\n\n**Total:** {total} produto(s)")[:4000],
+                color=0x8B2CF5,
             ),
             ephemeral=True,
         )
@@ -5051,22 +5363,82 @@ class CheckoutCommands(app_commands.Group):
         )
 
     @app_commands.command(
-        name="mistic-status", description="Testa credenciais MisticPay"
+        name="split-expandir",
+        description="Mostra todas as opções de um painel e o split efetivo",
     )
-    async def status(self, i: discord.Interaction):
+    @app_commands.describe(
+        painel="Nome que aparece no painel de vendas"
+    )
+    @app_commands.autocomplete(painel=split_panel_autocomplete)
+    async def split_expand(self, i: discord.Interaction, painel: str):
         if ADMIN_CHECK and not await ADMIN_CHECK(i):
             return
-        await i.response.defer(ephemeral=True, thinking=True)
-        try:
-            data = (await api("GET", "/users/info", guild_id=i.guild.id)).get(
-                "data"
-            ) or {}
-            await i.followup.send(
-                f"✅ Conectada: **{data.get('name', '-')}**\nConta verificada: `{data.get('accountVerified')}`\nSaldo: **{money(data.get('availableBalance', 0))}**",
+
+        panel = resolve_split_panel(i.guild.id, painel)
+        if not panel:
+            choices = get_split_panels(i.guild.id, painel, limit=20)
+            if not choices:
+                choices = get_split_panels(i.guild.id, limit=20)
+            lines = "\n".join(
+                f"• `{panel_display_name(row)}`"
+                for row in choices
+            ) or "Nenhum painel encontrado."
+            await i.response.send_message(
+                "❌ Painel não encontrado.\n\n"
+                f"**Painéis disponíveis:**\n{lines}",
                 ephemeral=True,
             )
-        except Exception as e:
-            await i.followup.send(f"❌ `{str(e)[:500]}`", ephemeral=True)
+            return
+
+        panel_id = int(panel["id"])
+        panel_name = panel_display_name(panel)
+        products = get_panel_products(i.guild.id, panel_id)
+
+        if not products:
+            await i.response.send_message(
+                f"🖼️ **{panel_name}** não possui produtos vinculados.",
+                ephemeral=True,
+            )
+            return
+
+        lines = []
+        for product in products:
+            try:
+                split = get_product_split(product)
+            except Exception as exc:
+                lines.append(
+                    f"`#{product['local_id']}` • **{product['name']}** • ❌ `{str(exc)[:80]}`"
+                )
+                continue
+
+            if not split:
+                status = "100% principal"
+            elif split.get("source") == "painel":
+                status = f"✅ {split['tax']:g}% split pelo painel"
+            elif split.get("source") == "produto":
+                status = f"⚠️ {split['tax']:g}% split individual"
+            else:
+                status = f"🧩 {split['tax']:g}% grupo legado"
+
+            lines.append(
+                f"`#{product['local_id']}` • **{product['name']}** • {status}"
+            )
+
+        description = (
+            f"🖼️ **{panel_name}**\n"
+            f"🆔 Painel interno: `{panel_id}`\n"
+            f"📦 Total de opções: **{len(products)}**\n\n"
+            + "\n".join(lines)
+        )
+
+        await i.response.send_message(
+            embed=discord.Embed(
+                title="🔎 Split • Opções do painel",
+                description=description[:4000],
+                color=0x8B2CF5,
+            ),
+            ephemeral=True,
+        )
 
 
 async def setup(bot, admin_check=None):
