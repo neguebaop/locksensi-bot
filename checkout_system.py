@@ -659,6 +659,34 @@ def ensure_split_schema():
         con._conn.execute(
             "ALTER TABLE products ADD COLUMN IF NOT EXISTS split_tax NUMERIC(5,2) DEFAULT 0"
         )
+        con._conn.execute(
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS split_override INTEGER DEFAULT 0"
+        )
+        # Splits individuais existentes continuam tendo prioridade.
+        con._conn.execute(
+            """
+            UPDATE products
+            SET split_override=1
+            WHERE COALESCE(split_enabled,0)=1
+              AND COALESCE(split_override,0)=0
+            """
+        )
+        # Regra por nome-base: cobre todas as opções/variações do mesmo painel.
+        con._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS split_group_rules(
+                id BIGSERIAL PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                match_text TEXT NOT NULL,
+                split_user TEXT NOT NULL,
+                split_tax NUMERIC(5,2) NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT,
+                updated_at TEXT,
+                UNIQUE(guild_id, match_text)
+            )
+            """
+        )
 
         # ID VISÍVEL/LOCAL por servidor.
         # O products.id continua sendo a chave global interna do banco, mas os
@@ -780,6 +808,12 @@ def ensure_split_schema():
         con._conn.execute(
             "ALTER TABLE orders ADD COLUMN IF NOT EXISTS split_amount NUMERIC(12,2) DEFAULT 0"
         )
+        con._conn.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS split_source TEXT"
+        )
+        con._conn.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS split_group TEXT"
+        )
         con.commit()
     finally:
         con.close()
@@ -792,41 +826,91 @@ def validate_split_email(value):
     return value
 
 
+def normalize_split_group(value):
+    value = re.sub(r"\s+", " ", str(value or "")).strip().lower()
+    if len(value) < 3:
+        raise ValueError("Use pelo menos 3 caracteres no nome-base do grupo.")
+    if len(value) > 80:
+        raise ValueError("O nome-base do grupo é muito grande.")
+    return value
+
+
+def mask_split_email(value):
+    value = str(value or "")
+    if "@" not in value:
+        return "***"
+    left, right = value.split("@", 1)
+    return (left[:2] + "***@" + right) if left else ("***@" + right)
+
+
+def get_split_group_rules(guild_id):
+    con = db()
+    try:
+        return con.execute(
+            """
+            SELECT id,guild_id,match_text,split_user,split_tax,active
+            FROM split_group_rules
+            WHERE guild_id=? AND active=1
+            ORDER BY LENGTH(match_text) DESC,id DESC
+            """,
+            (int(guild_id),),
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def find_matching_split_group(product):
+    if not product:
+        return None
+    guild_id = int(_row_value(product, "guild_id", 0) or 0)
+    product_name = str(_row_value(product, "name", "") or "").strip().lower()
+    if not guild_id or not product_name:
+        return None
+
+    for row in get_split_group_rules(guild_id):
+        match_text = normalize_split_group(_row_value(row, "match_text", ""))
+        if match_text in product_name:
+            split_user = validate_split_email(_row_value(row, "split_user", ""))
+            split_tax = round(float(_row_value(row, "split_tax", 0) or 0), 2)
+            if split_tax <= 0 or split_tax >= 100:
+                continue
+            return {
+                "user": split_user,
+                "tax": split_tax,
+                "source": "grupo",
+                "group": match_text,
+            }
+    return None
+
+
 def get_product_split(product):
-    """Retorna None ou a configuração válida do split do produto."""
+    """Split efetivo: configuração individual > grupo pelo nome > sem split."""
     if not product:
         return None
 
-    try:
-        enabled = int(product.get("split_enabled") or 0) == 1
-    except Exception:
-        enabled = int(product["split_enabled"] or 0) == 1
+    enabled = int(_row_value(product, "split_enabled", 0) or 0) == 1
+    override = int(_row_value(product, "split_override", 0) or 0) == 1
 
-    if not enabled:
+    # Compatibilidade total com o sistema antigo por ID.
+    if enabled:
+        split_user = validate_split_email(_row_value(product, "split_user", ""))
+        split_tax = round(float(_row_value(product, "split_tax", 0) or 0), 2)
+        if split_tax <= 0 or split_tax >= 100:
+            raise ValueError(
+                "Split individual deste produto está inválido. Configure uma porcentagem entre 0 e 100."
+            )
+        return {
+            "user": split_user,
+            "tax": split_tax,
+            "source": "produto",
+            "group": None,
+        }
+
+    # Produto explicitamente desligado não herda grupos.
+    if override:
         return None
 
-    try:
-        split_user = product.get("split_user")
-        split_tax = product.get("split_tax")
-    except Exception:
-        split_user = product["split_user"]
-        split_tax = product["split_tax"]
-
-    split_user = validate_split_email(split_user)
-    split_tax = round(float(split_tax or 0), 2)
-
-    # Não aceitamos 0% nem 100%: nesse caso é melhor deixar o produto
-    # sem split ou configurar a MisticPay principal do servidor.
-    if split_tax <= 0 or split_tax >= 100:
-        raise ValueError(
-            "Split deste produto está inválido. Configure uma porcentagem entre 0 e 100."
-        )
-
-    return {
-        "user": split_user,
-        "tax": split_tax,
-    }
-
+    return find_matching_split_group(product)
 
 def get_product(pid):
     con = db()
@@ -1737,6 +1821,8 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
         split_user = split["user"] if split else None
         split_tax = split["tax"] if split else 0.0
         split_amount = round(final_amount * split_tax / 100.0, 2) if split else 0.0
+        split_source = split.get("source") if split else "nenhum"
+        split_group = split.get("group") if split else None
 
         # Se existe cupom, reserva 1 utilização antes de criar o PIX.
         coupon_reserved = False
@@ -1764,10 +1850,10 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
             INSERT INTO orders(
                 guild_id,user_id,product_id,product_name,amount,
                 original_amount,coupon_code,coupon_percent,discount_amount,
-                split_user,split_tax,split_amount,
+                split_user,split_tax,split_amount,split_source,split_group,
                 status,code,payer_name,payer_document,payer_email,
                 cart_channel_id,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
                 (
                     i.guild.id,
@@ -1782,6 +1868,8 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
                     split_user,
                     split_tax,
                     split_amount,
+                    split_source,
+                    split_group,
                     "pendente",
                     local,
                     str(self.name),
@@ -1800,6 +1888,20 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
             raise
         finally:
             con.close()
+
+        if split:
+            print(
+                f"[SPLIT] pedido=#{oid} produto=#{_row_value(p, 'local_id', '?')} "
+                f"fonte={split_source} grupo={split_group or '-'} tax={split_tax:g}% "
+                f"destino={mask_split_email(split_user)} valor_split={money(split_amount)}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[SPLIT] pedido=#{oid} produto=#{_row_value(p, 'local_id', '?')} "
+                "fonte=nenhum -> 100% conta principal",
+                flush=True,
+            )
 
         try:
             res = await create_pix(
@@ -1872,7 +1974,8 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
                     name="🤝 Divisão automática",
                     value=(
                         f"Conta principal: **{100 - split_tax:g}%**\n"
-                        f"Parceiro: **{split_tax:g}%**"
+                        f"Parceiro: **{split_tax:g}%**\n"
+                        f"Regra: **{'grupo ' + split_group if split_group else 'produto individual'}**"
                     ),
                     inline=False,
                 )
@@ -3962,33 +4065,43 @@ class CheckoutCommands(app_commands.Group):
 
         global_product_id = int(product["id"])
         con = db()
-        con.execute(
-            """
-            UPDATE products
-            SET split_enabled=1,split_user=?,split_tax=?
-            WHERE id=? AND guild_id=?
-            """,
-            (split_user, porcentagem, global_product_id, i.guild.id),
-        )
-        con.commit()
-        con.close()
+        try:
+            con.execute(
+                """
+                UPDATE products
+                SET split_enabled=1,split_user=?,split_tax=?,split_override=1
+                WHERE id=? AND guild_id=?
+                """,
+                (split_user, porcentagem, global_product_id, i.guild.id),
+            )
+            con.commit()
+        finally:
+            con.close()
 
         await i.response.send_message(
-            "✅ **Split ativado somente neste produto.**\n\n"
+            "✅ **Split individual ativado neste produto.**\n\n"
             f"📦 Produto: **{product['name']}** (`#{produto_id}`)\n"
             f"🏦 MisticPay principal do servidor: **{100 - porcentagem:g}%**\n"
             f"🤝 Outra MisticPay (`{split_user}`): **{porcentagem:g}%**\n\n"
-            "Os outros produtos continuam enviando **100%** para a "
-            "MisticPay conectada ao servidor.",
+            "Esse override individual tem prioridade sobre regras de grupo. "
+            "Os outros produtos permanecem como estavam.",
             ephemeral=True,
         )
 
     @app_commands.command(
         name="split-remover",
-        description="Desativa o split de um produto",
+        description="Desativa o split individual de um produto",
     )
-    @app_commands.describe(produto_id="ID local do produto")
-    async def split_remove(self, i: discord.Interaction, produto_id: int):
+    @app_commands.describe(
+        produto_id="ID local do produto",
+        herdar_grupo="True = volta a herdar um split de grupo que combine com o nome",
+    )
+    async def split_remove(
+        self,
+        i: discord.Interaction,
+        produto_id: int,
+        herdar_grupo: bool = False,
+    ):
         if ADMIN_CHECK and not await ADMIN_CHECK(i):
             return
 
@@ -4005,27 +4118,42 @@ class CheckoutCommands(app_commands.Group):
 
         global_product_id = int(product["id"])
         con = db()
-        con.execute(
-            """
-            UPDATE products
-            SET split_enabled=0,split_user=NULL,split_tax=0
-            WHERE id=? AND guild_id=?
-            """,
-            (global_product_id, i.guild.id),
-        )
-        con.commit()
-        con.close()
+        try:
+            con.execute(
+                """
+                UPDATE products
+                SET split_enabled=0,split_user=NULL,split_tax=0,split_override=?
+                WHERE id=? AND guild_id=?
+                """,
+                (0 if herdar_grupo else 1, global_product_id, i.guild.id),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        refreshed = get_product(global_product_id)
+        effective = get_product_split(refreshed)
+        if effective:
+            detail = (
+                f"Agora ele herda o grupo `{effective.get('group')}`: "
+                f"**{effective['tax']:g}%** para `{effective['user']}`."
+            )
+        elif herdar_grupo:
+            detail = "Nenhum grupo corresponde ao nome; fica **100% na conta principal**."
+        else:
+            detail = (
+                "Ficou com bloqueio individual: **100% na conta principal**, "
+                "mesmo se o nome combinar com algum grupo."
+            )
 
         await i.response.send_message(
-            f"✅ Split removido de **{product['name']}**.\n"
-            "Agora esse produto volta a enviar **100%** para a "
-            "MisticPay principal do servidor.",
+            f"✅ Split individual removido de **{product['name']}**.\n{detail}",
             ephemeral=True,
         )
 
     @app_commands.command(
         name="split-status",
-        description="Mostra a divisão configurada em um produto",
+        description="Mostra a divisão efetiva configurada em um produto",
     )
     @app_commands.describe(produto_id="ID local do produto")
     async def split_status(self, i: discord.Interaction, produto_id: int):
@@ -4035,7 +4163,6 @@ class CheckoutCommands(app_commands.Group):
         product, _state = resolve_product_for_guild(
             produto_id, i.guild.id, repair=False
         )
-
         if not product:
             await i.response.send_message(
                 f"❌ Produto `#{produto_id}` não encontrado neste servidor.\n"
@@ -4044,28 +4171,39 @@ class CheckoutCommands(app_commands.Group):
             )
             return
 
-        enabled = int(product["split_enabled"] or 0) == 1
-        if not enabled:
+        try:
+            split = get_product_split(product)
+        except ValueError as exc:
+            await i.response.send_message(
+                f"⚠️ Configuração de split inválida: `{exc}`",
+                ephemeral=True,
+            )
+            return
+
+        if not split:
+            override = int(_row_value(product, "split_override", 0) or 0) == 1
+            reason = (
+                "bloqueio individual (override)" if override
+                else "nenhuma regra individual ou de grupo"
+            )
             await i.response.send_message(
                 f"📦 **{product['name']}** (`#{produto_id}`)\n"
-                "🤝 Split: **DESATIVADO**\n"
+                "🤝 Split efetivo: **DESATIVADO**\n"
+                f"ℹ️ Motivo: **{reason}**\n"
                 "🏦 Destino: **100% para a MisticPay principal do servidor**.",
                 ephemeral=True,
             )
             return
 
-        try:
-            split = get_product_split(product)
-        except ValueError as exc:
-            await i.response.send_message(
-                f"⚠️ O produto está marcado com split, mas a configuração é inválida: `{exc}`",
-                ephemeral=True,
-            )
-            return
-
+        source_text = (
+            f"Grupo `{split.get('group')}`"
+            if split.get("source") == "grupo"
+            else "Configuração individual do produto"
+        )
         await i.response.send_message(
             f"📦 **{product['name']}** (`#{produto_id}`)\n"
-            "🤝 Split: **ATIVADO**\n"
+            "🤝 Split efetivo: **ATIVADO**\n"
+            f"🧩 Origem: **{source_text}**\n"
             f"🏦 Conta principal: **{100 - split['tax']:g}%**\n"
             f"👤 `{split['user']}`: **{split['tax']:g}%**",
             ephemeral=True,
@@ -4073,44 +4211,291 @@ class CheckoutCommands(app_commands.Group):
 
     @app_commands.command(
         name="splits",
-        description="Lista os produtos que possuem split ativo",
+        description="Lista splits por grupo e overrides individuais",
     )
     async def splits_list(self, i: discord.Interaction):
         if ADMIN_CHECK and not await ADMIN_CHECK(i):
             return
 
         con = db()
-        rows = con.execute(
-            """
-            SELECT id,local_id,name,split_user,split_tax
-            FROM products
-            WHERE guild_id=? AND split_enabled=1
-            ORDER BY id DESC
-            LIMIT 40
-            """,
-            (i.guild.id,),
-        ).fetchall()
-        con.close()
+        try:
+            rows = con.execute(
+                """
+                SELECT id,local_id,name,split_user,split_tax
+                FROM products
+                WHERE guild_id=? AND split_enabled=1
+                ORDER BY local_id ASC
+                LIMIT 40
+                """,
+                (i.guild.id,),
+            ).fetchall()
+            groups = con.execute(
+                """
+                SELECT match_text,split_user,split_tax
+                FROM split_group_rules
+                WHERE guild_id=? AND active=1
+                ORDER BY LENGTH(match_text) DESC,match_text ASC
+                LIMIT 30
+                """,
+                (i.guild.id,),
+            ).fetchall()
+        finally:
+            con.close()
 
-        if not rows:
+        if not rows and not groups:
             await i.response.send_message(
-                "🤝 Nenhum produto com split ativo.",
+                "🤝 Nenhum split individual ou de grupo ativo.",
                 ephemeral=True,
             )
             return
 
+        sections = []
+        if groups:
+            lines = []
+            for row in groups:
+                tax = float(row["split_tax"] or 0)
+                lines.append(
+                    f"🧩 `{row['match_text']}` • "
+                    f"{100 - tax:g}% principal / {tax:g}% `{row['split_user']}`"
+                )
+            sections.append("**Grupos automáticos**\n" + "\n".join(lines))
+
+        if rows:
+            lines = []
+            for row in rows:
+                tax = float(row["split_tax"] or 0)
+                lines.append(
+                    f"📦 `#{row['local_id']}` • **{row['name']}** • "
+                    f"{100 - tax:g}% principal / {tax:g}% `{row['split_user']}`"
+                )
+            sections.append("**Overrides individuais**\n" + "\n".join(lines))
+
+        await i.response.send_message(
+            embed=discord.Embed(
+                title="🤝 Splits configurados",
+                description="\n\n".join(sections)[:4000],
+                color=0x8B2CF5,
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="split-grupo",
+        description="Ativa split em todas as opções com o mesmo nome-base",
+    )
+    @app_commands.describe(
+        nome="Nome-base comum. Ex: Lock Sensi Pro ou Estabilizador",
+        email="E-mail MisticPay que recebe a porcentagem",
+        porcentagem="Porcentagem enviada à outra conta. Ex: 50",
+        forcar="True = grupo passa a controlar inclusive produtos com override individual",
+    )
+    async def split_group_configure(
+        self,
+        i: discord.Interaction,
+        nome: str,
+        email: str,
+        porcentagem: float = 50.0,
+        forcar: bool = False,
+    ):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+
+        try:
+            match_text = normalize_split_group(nome)
+            split_user = validate_split_email(email)
+        except ValueError as exc:
+            await i.response.send_message(f"❌ {exc}", ephemeral=True)
+            return
+
+        porcentagem = round(float(porcentagem), 2)
+        if porcentagem <= 0 or porcentagem >= 100:
+            await i.response.send_message(
+                "❌ A porcentagem precisa ser maior que 0 e menor que 100.",
+                ephemeral=True,
+            )
+            return
+
+        con = db()
+        try:
+            matches = con.execute(
+                """
+                SELECT id,local_id,name,split_override,split_enabled
+                FROM products
+                WHERE guild_id=? AND LOWER(name) LIKE ?
+                ORDER BY local_id ASC
+                """,
+                (i.guild.id, f"%{match_text}%"),
+            ).fetchall()
+            if not matches:
+                await i.response.send_message(
+                    f"❌ Nenhum produto contém `{match_text}` no nome. "
+                    "Use `/loja produtos` para conferir os nomes.",
+                    ephemeral=True,
+                )
+                return
+            if len(matches) > 40:
+                await i.response.send_message(
+                    f"❌ `{match_text}` encontrou {len(matches)} produtos. "
+                    "Use um nome-base mais específico.",
+                    ephemeral=True,
+                )
+                return
+
+            now = now_iso()
+            con.execute(
+                """
+                INSERT INTO split_group_rules(
+                    guild_id,match_text,split_user,split_tax,active,created_at,updated_at
+                ) VALUES(?,?,?,?,1,?,?)
+                ON CONFLICT(guild_id,match_text) DO UPDATE SET
+                    split_user=excluded.split_user,
+                    split_tax=excluded.split_tax,
+                    active=1,
+                    updated_at=excluded.updated_at
+                """,
+                (i.guild.id, match_text, split_user, porcentagem, now, now),
+            )
+            if forcar:
+                con.execute(
+                    """
+                    UPDATE products
+                    SET split_enabled=0,split_user=NULL,split_tax=0,split_override=0
+                    WHERE guild_id=? AND LOWER(name) LIKE ?
+                    """,
+                    (i.guild.id, f"%{match_text}%"),
+                )
+            con.commit()
+        finally:
+            con.close()
+
+        overridden = 0
         lines = []
+        for row in matches:
+            override = int(_row_value(row, "split_override", 0) or 0) == 1
+            if override and not forcar:
+                overridden += 1
+                mark = "⚠️ override individual preservado"
+            else:
+                mark = "✅ controlado pelo grupo"
+            lines.append(f"`#{row['local_id']}` • {row['name']} • {mark}")
+
+        warning = ""
+        if overridden:
+            warning = (
+                f"\n\n⚠️ {overridden} produto(s) já tinham regra individual. "
+                "Use `forcar:True` para o grupo controlar todos."
+            )
+
+        await i.response.send_message(
+            "✅ **Split de grupo configurado.**\n\n"
+            f"🧩 Nome-base: `{match_text}`\n"
+            f"🏦 Principal: **{100 - porcentagem:g}%**\n"
+            f"🤝 `{split_user}`: **{porcentagem:g}%**\n\n"
+            "**Opções encontradas:**\n"
+            + "\n".join(lines)[:2600]
+            + warning
+            + "\n\nNovas opções com esse mesmo texto no nome também herdam o split automaticamente.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="split-grupo-remover",
+        description="Remove uma regra de split por nome-base",
+    )
+    @app_commands.describe(nome="Mesmo nome-base usado em /loja split-grupo")
+    async def split_group_remove(self, i: discord.Interaction, nome: str):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+        try:
+            match_text = normalize_split_group(nome)
+        except ValueError as exc:
+            await i.response.send_message(f"❌ {exc}", ephemeral=True)
+            return
+        con = db()
+        try:
+            cur = con.execute(
+                "DELETE FROM split_group_rules WHERE guild_id=? AND match_text=?",
+                (i.guild.id, match_text),
+            )
+            con.commit()
+            removed = int(getattr(cur, "rowcount", 0) or 0)
+        finally:
+            con.close()
+        await i.response.send_message(
+            (
+                f"✅ Grupo `{match_text}` removido. Splits individuais antigos foram preservados."
+                if removed
+                else f"⚠️ Não existe grupo `{match_text}` neste servidor."
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="split-diagnostico",
+        description="Mostra o split efetivo e os últimos pedidos do produto",
+    )
+    @app_commands.describe(produto_id="ID local do produto neste servidor")
+    async def split_diagnostic(self, i: discord.Interaction, produto_id: int):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+        product, _state = resolve_product_for_guild(produto_id, i.guild.id, repair=False)
+        if not product:
+            await i.response.send_message(f"❌ Produto `#{produto_id}` não encontrado.", ephemeral=True)
+            return
+
+        try:
+            split = get_product_split(product)
+            err = None
+        except Exception as exc:
+            split = None
+            err = str(exc)
+
+        con = db()
+        try:
+            rows = con.execute(
+                """
+                SELECT id,status,amount,split_user,split_tax,split_amount,
+                       split_source,split_group,created_at
+                FROM orders
+                WHERE guild_id=? AND product_id=?
+                ORDER BY id DESC
+                LIMIT 5
+                """,
+                (i.guild.id, int(product["id"])),
+            ).fetchall()
+        finally:
+            con.close()
+
+        if err:
+            effective = f"❌ Configuração inválida: `{err}`"
+        elif split:
+            src = f"grupo `{split.get('group')}`" if split.get("source") == "grupo" else "produto individual"
+            effective = (
+                f"✅ **ATIVO** por {src}\n"
+                f"Principal: **{100 - split['tax']:g}%** • `{split['user']}`: **{split['tax']:g}%**"
+            )
+        else:
+            effective = "❌ **DESATIVADO** → 100% para a conta principal"
+
+        history = []
         for row in rows:
-            tax = float(row["split_tax"] or 0)
-            lines.append(
-                f"`#{row['local_id']}` • **{row['name']}** • "
-                f"{100 - tax:g}% principal / {tax:g}% `{row['split_user']}`"
+            tax = float(_row_value(row, "split_tax", 0) or 0)
+            src = _row_value(row, "split_source", None) or ("produto" if tax else "nenhum")
+            grp = _row_value(row, "split_group", None)
+            suffix = f" • grupo={grp}" if grp else ""
+            history.append(
+                f"`#{row['id']}` {row['status']} • {money(row['amount'])} • split={tax:g}% • fonte={src}{suffix}"
             )
 
         await i.response.send_message(
             embed=discord.Embed(
-                title="🤝 Splits por produto",
-                description="\n".join(lines)[:4000],
+                title="🧪 Diagnóstico de Split",
+                description=(
+                    f"📦 **{product['name']}** (`#{produto_id}`)\n\n"
+                    f"**Próximo PIX:**\n{effective}\n\n"
+                    "**Últimos pedidos:**\n"
+                    + ("\n".join(history) if history else "Nenhum pedido encontrado.")
+                )[:4000],
                 color=0x8B2CF5,
             ),
             ephemeral=True,
