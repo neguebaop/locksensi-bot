@@ -345,16 +345,66 @@ class PanelOptionsButton(discord.ui.Button):
         )
 
 
-class PanelOptionsView(discord.ui.View):
+class PanelOptionsView(discord.ui.LayoutView):
     def __init__(self, panel_id: int):
         super().__init__(timeout=None)
-        self.add_item(PanelOptionsButton(panel_id))
+        self.panel_id = int(panel_id)
+
+        con = db()
+        try:
+            panel = con.execute(
+                "SELECT * FROM panels WHERE id=?", (self.panel_id,)
+            ).fetchone()
+        finally:
+            con.close()
+
+        if not panel:
+            self.add_item(discord.ui.TextDisplay("## Painel não encontrado"))
+            return
+
+        try:
+            custom = get_customization(int(panel["guild_id"]))
+            store_name = custom["store_name"] or "Entregas automática"
+            color = custom["color"] or panel["color"] or 0x5865F2
+        except Exception:
+            store_name = "Entregas automática"
+            color = panel["color"] or 0x5865F2
+
+        title = str(panel["title"] or panel["name"] or "Produtos").strip()
+        description = str(panel["description"] or "Confira as opções disponíveis.").strip()
+        large_image = str(panel["banner_url"] or panel["image_url"] or "").strip()
+
+        container = discord.ui.Container(accent_color=int(color))
+        if valid_url(large_image):
+            gallery = discord.ui.MediaGallery()
+            gallery.add_item(media=large_image, description=title[:256])
+            container.add_item(gallery)
+
+        container.add_item(discord.ui.Separator(visible=True))
+        container.add_item(discord.ui.TextDisplay(f"## {title}"))
+        container.add_item(discord.ui.Separator(visible=True))
+        container.add_item(discord.ui.TextDisplay(description[:3900]))
+        container.add_item(discord.ui.Separator(visible=True))
+        container.add_item(
+            discord.ui.TextDisplay(f"-# {store_name} • Painel de vendas")
+        )
+
+        self.add_item(container)
+        self.add_item(discord.ui.ActionRow(PanelOptionsButton(self.panel_id)))
 
 
 def panel_view(panel_id: int):
     if get_panel_mode(panel_id) == "button":
         return PanelOptionsView(panel_id)
     return PanelOnlyView(panel_id)
+
+
+def panel_send_kwargs(panel_id: int):
+    """Monta a mensagem correta para o modo clássico ou Components V2."""
+    view = panel_view(panel_id)
+    if isinstance(view, discord.ui.LayoutView):
+        return {"view": view}
+    return {"embed": panel_embed(panel_id), "view": view}
 
 
 class PanelSelect(discord.ui.Select):
@@ -809,16 +859,12 @@ class ConfigPanelView(discord.ui.View):
     @discord.ui.button(label="👁️ Prévia", style=discord.ButtonStyle.gray)
     async def preview(self, interaction, button):
         await interaction.response.send_message(
-            embed=panel_embed(self.panel_id),
-            view=panel_view(self.panel_id),
-            ephemeral=True,
+            **panel_send_kwargs(self.panel_id), ephemeral=True
         )
 
     @discord.ui.button(label="🚀 Publicar aqui", style=discord.ButtonStyle.red)
     async def publish_here(self, interaction, button):
-        await interaction.channel.send(
-            embed=panel_embed(self.panel_id), view=panel_view(self.panel_id)
-        )
+        await interaction.channel.send(**panel_send_kwargs(self.panel_id))
         await interaction.response.send_message(
             "✅ Painel publicado neste canal/tópico.", ephemeral=True
         )
@@ -1444,7 +1490,7 @@ async def publicar_painel(
     if not await protected_admin_only(interaction):
         return
     canal = canal or interaction.channel
-    msg = await canal.send(embed=panel_embed(painel_id), view=panel_view(painel_id))
+    msg = await canal.send(**panel_send_kwargs(painel_id))
     con = db()
     con.execute(
         "UPDATE panels SET channel_id=?,message_id=? WHERE id=?",
@@ -1504,9 +1550,17 @@ async def painel_modo(
             channel = interaction.guild.get_channel(int(panel["channel_id"]))
             if channel:
                 message = await channel.fetch_message(int(panel["message_id"]))
-                await message.edit(
-                    embed=panel_embed(painel_id), view=panel_view(painel_id)
-                )
+                if modo.value == "button":
+                    await message.edit(
+                        content=None,
+                        embed=None,
+                        attachments=[],
+                        view=PanelOptionsView(painel_id),
+                    )
+                else:
+                    await message.edit(
+                        embed=panel_embed(painel_id), view=PanelOnlyView(painel_id)
+                    )
                 updated = True
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
