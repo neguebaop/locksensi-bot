@@ -86,6 +86,8 @@ intents.members = True
 intents.message_content = True
 intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+RANKING_REFRESH_LOCKS = {}
+RANKING_REFRESH_TIMES = {}
 
 
 # ================= HELPERS =================
@@ -312,6 +314,49 @@ class PanelOnlyView(discord.ui.View):
         self.add_item(PanelSelect(panel_id))
 
 
+def get_panel_mode(panel_id: int) -> str:
+    con = db()
+    try:
+        row = con.execute(
+            "SELECT display_mode FROM panels WHERE id=?", (int(panel_id),)
+        ).fetchone()
+    finally:
+        con.close()
+    mode = str(row["display_mode"] or "select").lower() if row else "select"
+    return "button" if mode == "button" else "select"
+
+
+class PanelOptionsButton(discord.ui.Button):
+    def __init__(self, panel_id: int):
+        super().__init__(
+            label="Opções",
+            emoji="🛒",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"panel_options_{int(panel_id)}",
+            row=0,
+        )
+        self.panel_id = int(panel_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "**Selecione um Produto**",
+            view=PanelOnlyView(self.panel_id),
+            ephemeral=True,
+        )
+
+
+class PanelOptionsView(discord.ui.View):
+    def __init__(self, panel_id: int):
+        super().__init__(timeout=None)
+        self.add_item(PanelOptionsButton(panel_id))
+
+
+def panel_view(panel_id: int):
+    if get_panel_mode(panel_id) == "button":
+        return PanelOptionsView(panel_id)
+    return PanelOnlyView(panel_id)
+
+
 class PanelSelect(discord.ui.Select):
     def __init__(self, panel_id: int):
         self.panel_id = panel_id
@@ -339,7 +384,7 @@ class PanelSelect(discord.ui.Select):
                 )
             ]
         super().__init__(
-            placeholder="Escolha uma opção...",
+            placeholder="Selecione um Produto",
             min_values=1,
             max_values=1,
             options=options,
@@ -421,6 +466,227 @@ def panel_embed(panel_id: int):
         embed.set_image(url=panel["banner_url"])
     embed.set_footer(text=f"{loja} • Painel de vendas")
     return embed
+
+
+# ================= RANKING DE COMPRADORES =================
+def get_ranking_rows(guild_id: int, limit: int = 10):
+    con = db()
+    try:
+        return con.execute(
+            """
+            SELECT user_id,COUNT(*) AS purchases,COALESCE(SUM(amount),0) AS total
+            FROM orders
+            WHERE guild_id=? AND status='aprovado' AND COALESCE(is_test,0)=0
+            GROUP BY user_id
+            ORDER BY total DESC,purchases DESC,user_id ASC
+            LIMIT ?
+            """,
+            (int(guild_id), max(1, min(int(limit), 25))),
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def get_ranking_config(guild_id: int):
+    con = db()
+    try:
+        return con.execute(
+            "SELECT * FROM ranking_config WHERE guild_id=?", (int(guild_id),)
+        ).fetchone()
+    finally:
+        con.close()
+
+
+def ranking_embed(guild: discord.Guild, rows=None):
+    rows = rows if rows is not None else get_ranking_rows(guild.id, 10)
+    medals = ("🥇", "🥈", "🥉")
+    lines = []
+    for position, row in enumerate(rows, start=1):
+        badge = medals[position - 1] if position <= 3 else f"`#{position:02d}`"
+        lines.append(
+            f"{badge} <@{int(row['user_id'])}>\n"
+            f"      **{money(row['total'])}** • {int(row['purchases'])} compra(s)"
+        )
+
+    cfg = get_ranking_config(guild.id)
+    role_text = "Não configurado"
+    winners = 0
+    if cfg and cfg["role_id"]:
+        role_text = f"<@&{int(cfg['role_id'])}>"
+        winners = max(1, min(int(cfg["top_count"] or 1), 10))
+
+    embed = discord.Embed(
+        title="🏆 RANKING DOS MAIORES COMPRADORES",
+        description=(
+            "Os clientes que mais investiram na loja aparecem aqui.\n\n"
+            + ("\n\n".join(lines) if lines else "*Ainda não há compras aprovadas.*")
+        ),
+        color=0xD4AF37,
+    )
+    embed.add_field(
+        name="💎 Recompensa",
+        value=(
+            f"{role_text} para o **Top {winners}**"
+            if winners
+            else role_text
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Ranking considera somente pagamentos reais aprovados")
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+
+async def sync_ranking_role(guild: discord.Guild, rows=None):
+    cfg = get_ranking_config(guild.id)
+    if not cfg or not cfg["role_id"]:
+        return "Nenhum cargo de premiação configurado."
+
+    role = guild.get_role(int(cfg["role_id"]))
+    if not role:
+        return "O cargo configurado não existe mais."
+    if not guild.me or role >= guild.me.top_role:
+        return "Coloque o cargo do bot acima do cargo de rico."
+
+    rows = rows if rows is not None else get_ranking_rows(guild.id, 10)
+    top_count = max(1, min(int(cfg["top_count"] or 1), 10))
+    winners = {int(row["user_id"]) for row in rows[:top_count]}
+
+    con = db()
+    try:
+        previous = {
+            int(row["user_id"])
+            for row in con.execute(
+                "SELECT user_id FROM ranking_awards WHERE guild_id=? AND role_id=?",
+                (guild.id, role.id),
+            ).fetchall()
+        }
+    finally:
+        con.close()
+
+    added = removed = 0
+    for user_id in previous - winners:
+        member = guild.get_member(user_id)
+        try:
+            if member and role in member.roles:
+                await member.remove_roles(role, reason="Saiu da faixa premiada do ranking")
+            con = db()
+            con.execute(
+                "DELETE FROM ranking_awards WHERE guild_id=? AND user_id=? AND role_id=?",
+                (guild.id, user_id, role.id),
+            )
+            con.commit()
+            con.close()
+            removed += 1
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+
+    for user_id in winners:
+        member = guild.get_member(user_id)
+        if not member:
+            continue
+        already_tracked = user_id in previous
+        had_role = role in member.roles
+        try:
+            if not had_role:
+                await member.add_roles(role, reason="Premiação do ranking de compradores")
+                added += 1
+            # Só rastreia para remoção futura quem o ranking realmente administra.
+            if already_tracked or not had_role:
+                con = db()
+                con.execute(
+                    """
+                    INSERT INTO ranking_awards(guild_id,user_id,role_id,awarded_at)
+                    VALUES(?,?,?,NOW())
+                    ON CONFLICT(guild_id,user_id,role_id)
+                    DO UPDATE SET awarded_at=excluded.awarded_at
+                    """,
+                    (guild.id, user_id, role.id),
+                )
+                con.commit()
+                con.close()
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+
+    return f"Cargo sincronizado: {added} adicionado(s), {removed} removido(s)."
+
+
+async def clear_tracked_ranking_role(guild: discord.Guild, role_id: int):
+    """Remove somente o cargo antigo que foi registrado como entregue pelo ranking."""
+    role = guild.get_role(int(role_id))
+    con = db()
+    try:
+        tracked = con.execute(
+            "SELECT user_id FROM ranking_awards WHERE guild_id=? AND role_id=?",
+            (guild.id, int(role_id)),
+        ).fetchall()
+    finally:
+        con.close()
+
+    for row in tracked:
+        user_id = int(row["user_id"])
+        member = guild.get_member(user_id)
+        try:
+            if role and member and role in member.roles:
+                await member.remove_roles(
+                    role, reason="Cargo de premiação do ranking foi alterado"
+                )
+            con = db()
+            con.execute(
+                "DELETE FROM ranking_awards WHERE guild_id=? AND user_id=? AND role_id=?",
+                (guild.id, user_id, int(role_id)),
+            )
+            con.commit()
+            con.close()
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+
+
+class RankingView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.add_item(RankingRefreshButton(self.guild_id))
+
+
+class RankingRefreshButton(discord.ui.Button):
+    def __init__(self, guild_id: int):
+        super().__init__(
+            label="Atualizar ranking",
+            emoji="🔄",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"ranking_refresh_{int(guild_id)}",
+        )
+        self.guild_id = int(guild_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or interaction.guild.id != self.guild_id:
+            await interaction.response.send_message(
+                "Este ranking pertence a outro servidor.", ephemeral=True
+            )
+            return
+
+        now = asyncio.get_running_loop().time()
+        last = RANKING_REFRESH_TIMES.get(self.guild_id, 0)
+        if now - last < 10:
+            await interaction.response.send_message(
+                "⏳ Aguarde alguns segundos antes de atualizar novamente.", ephemeral=True
+            )
+            return
+
+        lock = RANKING_REFRESH_LOCKS.setdefault(self.guild_id, asyncio.Lock())
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with lock:
+            rows = get_ranking_rows(self.guild_id, 10)
+            role_result = await sync_ranking_role(interaction.guild, rows)
+            await interaction.message.edit(
+                embed=ranking_embed(interaction.guild, rows),
+                view=RankingView(self.guild_id),
+            )
+            RANKING_REFRESH_TIMES[self.guild_id] = now
+        await interaction.followup.send(
+            f"✅ Ranking atualizado. {role_result}", ephemeral=True
+        )
 
 
 # ================= MODALS PAINEL =================
@@ -544,17 +810,31 @@ class ConfigPanelView(discord.ui.View):
     async def preview(self, interaction, button):
         await interaction.response.send_message(
             embed=panel_embed(self.panel_id),
-            view=PanelOnlyView(self.panel_id),
+            view=panel_view(self.panel_id),
             ephemeral=True,
         )
 
     @discord.ui.button(label="🚀 Publicar aqui", style=discord.ButtonStyle.red)
     async def publish_here(self, interaction, button):
         await interaction.channel.send(
-            embed=panel_embed(self.panel_id), view=PanelOnlyView(self.panel_id)
+            embed=panel_embed(self.panel_id), view=panel_view(self.panel_id)
         )
         await interaction.response.send_message(
             "✅ Painel publicado neste canal/tópico.", ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="🛒 Usar botão Opções", style=discord.ButtonStyle.secondary, row=1
+    )
+    async def options_mode(self, interaction, button):
+        con = db()
+        con.execute(
+            "UPDATE panels SET display_mode='button' WHERE id=?", (self.panel_id,)
+        )
+        con.commit()
+        con.close()
+        await interaction.response.send_message(
+            "✅ Este painel agora usa o botão **Opções**.", ephemeral=True
         )
 
 
@@ -686,12 +966,18 @@ async def on_ready():
         con = db()
         paineis = con.execute("SELECT * FROM panels").fetchall()
         produtos = con.execute("SELECT * FROM products WHERE active=1").fetchall()
+        rankings = con.execute("SELECT guild_id FROM ranking_config").fetchall()
         con.close()
         for painel in paineis:
             try:
-                bot.add_view(PanelOnlyView(int(painel["id"])))
+                bot.add_view(panel_view(int(painel["id"])))
             except Exception as e:
                 print("erro restaurando painel", painel["id"], e)
+        for ranking in rankings:
+            try:
+                bot.add_view(RankingView(int(ranking["guild_id"])))
+            except Exception as e:
+                print("erro restaurando ranking", ranking["guild_id"], e)
         for produto in produtos:
             try:
                 bot.add_view(BuyView(product_id=int(produto["id"])))
@@ -701,7 +987,8 @@ async def on_ready():
         # As classes PremiumPanelView/PurchaseReceiptView pertenciam a uma versão
         # anterior e foram removidas para evitar NameError na inicialização.
         print(
-            f"Views persistentes restauradas: {len(paineis)} painel(is) e {len(produtos)} produto(s)"
+            f"Views persistentes restauradas: {len(paineis)} painel(is), "
+            f"{len(produtos)} produto(s) e {len(rankings)} ranking(s)"
         )
     except Exception as e:
         print("Erro restaurando views persistentes:", e)
@@ -1084,13 +1371,14 @@ async def criar_painel_config(interaction, nome: str):
     con = db()
     cur = con.cursor()
     cur.execute(
-        "INSERT INTO panels(guild_id,name,title,description,channel_id) VALUES(?,?,?,?,?)",
+        "INSERT INTO panels(guild_id,name,title,description,channel_id,display_mode) VALUES(?,?,?,?,?,?)",
         (
             interaction.guild.id,
             nome,
             nome,
             "Configure a descrição deste painel clicando nos botões abaixo.",
             interaction.channel.id,
+            "button",
         ),
     )
     panel_id = cur.lastrowid
@@ -1156,7 +1444,7 @@ async def publicar_painel(
     if not await protected_admin_only(interaction):
         return
     canal = canal or interaction.channel
-    msg = await canal.send(embed=panel_embed(painel_id), view=PanelOnlyView(painel_id))
+    msg = await canal.send(embed=panel_embed(painel_id), view=panel_view(painel_id))
     con = db()
     con.execute(
         "UPDATE panels SET channel_id=?,message_id=? WHERE id=?",
@@ -1166,6 +1454,144 @@ async def publicar_painel(
     con.close()
     await interaction.response.send_message(
         f"✅ Painel publicado em {canal.mention}", ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="painel-modo",
+    description="Escolhe se o painel mostra botão Opções ou a lista direta",
+)
+@app_commands.describe(
+    painel_id="ID do painel",
+    modo="Visual do painel de vendas",
+)
+@app_commands.choices(
+    modo=[
+        app_commands.Choice(name="Botão Opções (recomendado)", value="button"),
+        app_commands.Choice(name="Lista direta", value="select"),
+    ]
+)
+async def painel_modo(
+    interaction: discord.Interaction,
+    painel_id: int,
+    modo: app_commands.Choice[str],
+):
+    if not await protected_admin_only(interaction):
+        return
+
+    con = db()
+    panel = con.execute(
+        "SELECT * FROM panels WHERE id=? AND guild_id=?",
+        (painel_id, interaction.guild.id),
+    ).fetchone()
+    if not panel:
+        con.close()
+        await interaction.response.send_message(
+            "❌ Painel não encontrado neste servidor.", ephemeral=True
+        )
+        return
+    con.execute(
+        "UPDATE panels SET display_mode=? WHERE id=?",
+        (modo.value, painel_id),
+    )
+    con.commit()
+    con.close()
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    updated = False
+    if panel["channel_id"] and panel["message_id"]:
+        try:
+            channel = interaction.guild.get_channel(int(panel["channel_id"]))
+            if channel:
+                message = await channel.fetch_message(int(panel["message_id"]))
+                await message.edit(
+                    embed=panel_embed(painel_id), view=panel_view(painel_id)
+                )
+                updated = True
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    label = "botão **🛒 Opções**" if modo.value == "button" else "lista direta"
+    suffix = " O painel publicado também foi atualizado." if updated else ""
+    await interaction.followup.send(
+        f"✅ Painel configurado com {label}.{suffix}", ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="ranking",
+    description="Publica o ranking dos maiores compradores com cargo de premiação",
+)
+@app_commands.describe(
+    cargo="Cargo de rico entregue aos vencedores",
+    premiados="Quantidade de compradores que receberão o cargo (1 a 10)",
+    canal="Canal onde o ranking será publicado",
+)
+async def ranking(
+    interaction: discord.Interaction,
+    cargo: discord.Role,
+    premiados: int = 1,
+    canal: Optional[discord.TextChannel] = None,
+):
+    if not await protected_admin_only(interaction):
+        return
+    if cargo.is_default():
+        await interaction.response.send_message(
+            "❌ Escolha um cargo específico, não o @everyone.", ephemeral=True
+        )
+        return
+    if not interaction.guild.me or cargo >= interaction.guild.me.top_role:
+        await interaction.response.send_message(
+            "❌ O cargo do bot precisa ficar acima do cargo escolhido.", ephemeral=True
+        )
+        return
+
+    premiados = max(1, min(int(premiados or 1), 10))
+    canal = canal or interaction.channel
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    previous_cfg = get_ranking_config(interaction.guild.id)
+    if (
+        previous_cfg
+        and previous_cfg["role_id"]
+        and int(previous_cfg["role_id"]) != cargo.id
+    ):
+        await clear_tracked_ranking_role(
+            interaction.guild, int(previous_cfg["role_id"])
+        )
+
+    con = db()
+    con.execute(
+        """
+        INSERT INTO ranking_config(guild_id,role_id,top_count,channel_id,updated_at)
+        VALUES(?,?,?,?,NOW())
+        ON CONFLICT(guild_id) DO UPDATE SET
+            role_id=excluded.role_id,
+            top_count=excluded.top_count,
+            channel_id=excluded.channel_id,
+            updated_at=excluded.updated_at
+        """,
+        (interaction.guild.id, cargo.id, premiados, canal.id),
+    )
+    con.commit()
+    con.close()
+
+    rows = get_ranking_rows(interaction.guild.id, 10)
+    role_result = await sync_ranking_role(interaction.guild, rows)
+    message = await canal.send(
+        embed=ranking_embed(interaction.guild, rows),
+        view=RankingView(interaction.guild.id),
+    )
+    con = db()
+    con.execute(
+        "UPDATE ranking_config SET channel_id=?,message_id=?,updated_at=NOW() WHERE guild_id=?",
+        (canal.id, message.id, interaction.guild.id),
+    )
+    con.commit()
+    con.close()
+
+    await interaction.followup.send(
+        f"✅ Ranking publicado em {canal.mention}. {role_result}", ephemeral=True
     )
 
 
@@ -1755,4 +2181,3 @@ except Exception as exc:
     )
     traceback.print_exc()
     raise
-
