@@ -638,6 +638,9 @@ def ensure_coupon_schema():
         con._conn.execute(
             "ALTER TABLE coupons ADD COLUMN IF NOT EXISTS used_count INTEGER NOT NULL DEFAULT 0"
         )
+        con._conn.execute(
+            "ALTER TABLE coupons ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP"
+        )
         con._conn.execute("UPDATE coupons SET used_count=0 WHERE used_count IS NULL")
         con.commit()
     finally:
@@ -1175,6 +1178,28 @@ def normalize_coupon_code(value):
     return re.sub(r"[^A-Z0-9_-]+", "", value)[:32]
 
 
+def coupon_expiration(row):
+    """Retorna o vencimento em UTC, aceitando datetime ou texto do banco."""
+    value = row["expires_at"] if row and "expires_at" in row.keys() else None
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        expires = value
+    else:
+        try:
+            expires = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return expires.astimezone(timezone.utc)
+
+
+def coupon_is_expired(row):
+    expires = coupon_expiration(row)
+    return bool(expires and expires <= datetime.now(timezone.utc))
+
+
 def get_coupon(guild_id, coupon_code, product_id=None, include_inactive=False):
     """
     Busca cupom pelo código.
@@ -1195,6 +1220,9 @@ def get_coupon(guild_id, coupon_code, product_id=None, include_inactive=False):
         return None
 
     if not include_inactive and int(row["active"] or 0) != 1:
+        return None
+
+    if not include_inactive and coupon_is_expired(row):
         return None
 
     # Cupom antigo com product_id NULL continua compatível como cupom geral.
@@ -1298,6 +1326,7 @@ def reserve_coupon_usage(guild_id, coupon_code, product_id):
             WHERE guild_id=?
               AND code=?
               AND active=1
+              AND (expires_at IS NULL OR expires_at>CURRENT_TIMESTAMP)
               AND (product_id IS NULL OR product_id=?)
               AND (max_uses IS NULL OR used_count < max_uses)
             RETURNING id,code,used_count,max_uses
@@ -1742,6 +1771,13 @@ class CouponModal(discord.ui.Modal, title="Inserir cupom"):
         if int(coupon_any["active"] or 0) != 1:
             await i.response.send_message(
                 "❌ Este cupom está desativado.",
+                ephemeral=True,
+            )
+            return
+
+        if coupon_is_expired(coupon_any):
+            await i.response.send_message(
+                "❌ Este cupom expirou.",
                 ephemeral=True,
             )
             return
@@ -2243,6 +2279,32 @@ class VerifyView(discord.ui.View):
         await i.response.defer(ephemeral=True, thinking=True)
         ok, msg = await verify(self.oid)
         await i.followup.send(msg, ephemeral=True)
+
+    @discord.ui.button(
+        label="Copiar PIX",
+        emoji="📋",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def copy_pix(self, i, b):
+        if i.user.id != self.uid:
+            await i.response.send_message(
+                "Pagamento de outra pessoa.",
+                ephemeral=True,
+            )
+            return
+
+        order = get_order(self.oid)
+        pix_code = str(order["pix_code"] or "").strip() if order else ""
+        if not pix_code:
+            await i.response.send_message(
+                "❌ O código PIX deste pedido não está disponível.",
+                ephemeral=True,
+            )
+            return
+
+        # Envia somente o payload original. Alterar/remover caracteres pode
+        # invalidar o PIX; o bloco do Discord oferece o ícone de copiar.
+        await i.response.send_message(f"```{pix_code[:1900]}```", ephemeral=True)
 
 
 async def verify(oid, force=False):
@@ -5053,6 +5115,13 @@ class CheckoutCommands(app_commands.Group):
 
         max_uses = row["max_uses"]
         used = int(row["used_count"] or 0)
+        if coupon_is_expired(row):
+            await i.response.send_message(
+                "❌ Esse cupom já expirou. Execute novamente "
+                "`/cupom todos-produtos` para definir um novo prazo.",
+                ephemeral=True,
+            )
+            return
         if max_uses is not None and used >= int(max_uses):
             await i.response.send_message(
                 "❌ Esse cupom já esgotou as utilizações. "
@@ -5120,7 +5189,7 @@ class CheckoutCommands(app_commands.Group):
             """
             SELECT
                 c.code,c.discount_percent,c.active,
-                c.max_uses,c.used_count,c.product_id,
+                c.max_uses,c.used_count,c.product_id,c.expires_at,
                 p.name AS product_name,p.local_id
             FROM coupons c
             LEFT JOIN products p
@@ -5145,15 +5214,20 @@ class CheckoutCommands(app_commands.Group):
             max_uses = r["max_uses"]
             used = int(r["used_count"] or 0)
             remaining = "∞" if max_uses is None else str(max(0, int(max_uses) - used))
-            status = "🟢" if int(r["active"] or 0) == 1 else "🔴"
+            expired = coupon_is_expired(r)
+            status = "⌛" if expired else ("🟢" if int(r["active"] or 0) == 1 else "🔴")
             product_txt = (
                 f"{r['product_name']} #{r['local_id']}"
                 if r["product_name"]
-                else "geral/antigo"
+                else "todos os produtos"
+            )
+            expires = coupon_expiration(r)
+            expiry_txt = (
+                f" • ⏳ <t:{int(expires.timestamp())}:R>" if expires else ""
             )
             lines.append(
                 f"{status} `{r['code']}` • **{float(r['discount_percent']):g}%** "
-                f"• 📦 {product_txt} • 🎟️ restantes: **{remaining}**"
+                f"• 📦 {product_txt} • 🎟️ restantes: **{remaining}**{expiry_txt}"
             )
 
         embed = discord.Embed(
@@ -5441,6 +5515,124 @@ class CheckoutCommands(app_commands.Group):
         )
 
 
+class CouponCommands(app_commands.Group):
+    def __init__(self):
+        super().__init__(name="cupom", description="Cupons gerais da loja")
+
+    @app_commands.command(
+        name="todos-produtos",
+        description="Cria um cupom temporário válido para todos os produtos",
+    )
+    @app_commands.describe(
+        nome="Código que o cliente digitará. Ex: LOCKSENSI",
+        desconto="Porcentagem de desconto. Ex: 20",
+        duracao="Por quanto tempo o cupom ficará ativo",
+        unidade="Escolha horas ou dias",
+        limite_usos="0 para ilimitado ou a quantidade máxima de usos",
+    )
+    @app_commands.choices(
+        unidade=[
+            app_commands.Choice(name="Horas", value="horas"),
+            app_commands.Choice(name="Dias", value="dias"),
+        ]
+    )
+    async def all_products(
+        self,
+        i: discord.Interaction,
+        nome: str,
+        desconto: float,
+        duracao: int,
+        unidade: app_commands.Choice[str],
+        limite_usos: int = 0,
+    ):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+
+        coupon_code = normalize_coupon_code(nome)
+        if not coupon_code:
+            await i.response.send_message("❌ Código de cupom inválido.", ephemeral=True)
+            return
+
+        discount = round(float(desconto), 2)
+        if discount <= 0 or discount >= 100:
+            await i.response.send_message(
+                "❌ O desconto precisa ser maior que 0% e menor que 100%.",
+                ephemeral=True,
+            )
+            return
+
+        if duracao <= 0:
+            await i.response.send_message(
+                "❌ A duração precisa ser maior que zero.", ephemeral=True
+            )
+            return
+
+        hours = duracao if unidade.value == "horas" else duracao * 24
+        if hours > 24 * 365:
+            await i.response.send_message(
+                "❌ A duração máxima é de 365 dias.", ephemeral=True
+            )
+            return
+
+        if limite_usos < 0 or limite_usos > 100000:
+            await i.response.send_message(
+                "❌ O limite deve ser 0 (ilimitado) ou entre 1 e 100000.",
+                ephemeral=True,
+            )
+            return
+
+        expires = datetime.now(timezone.utc) + timedelta(hours=hours)
+        expires_db = expires.strftime("%Y-%m-%d %H:%M:%S")
+        max_uses = None if limite_usos == 0 else limite_usos
+
+        con = db()
+        try:
+            con.execute(
+                """
+                INSERT INTO coupons(
+                    guild_id,code,discount_percent,product_id,
+                    max_uses,used_count,active,expires_at,created_at,updated_at
+                ) VALUES(?,?,?,NULL,?,0,1,?,?,?)
+                ON CONFLICT(guild_id,code) DO UPDATE SET
+                    discount_percent=excluded.discount_percent,
+                    product_id=NULL,
+                    max_uses=excluded.max_uses,
+                    used_count=0,
+                    active=1,
+                    expires_at=excluded.expires_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    i.guild.id,
+                    coupon_code,
+                    discount,
+                    max_uses,
+                    expires_db,
+                    now_iso(),
+                    now_iso(),
+                ),
+            )
+            con.execute(
+                "DELETE FROM cart_coupons WHERE guild_id=? AND coupon_code=?",
+                (i.guild.id, coupon_code),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        discord_timestamp = int(expires.timestamp())
+        uses_text = "ilimitados" if max_uses is None else str(max_uses)
+        await i.response.send_message(
+            "✅ **Cupom geral liberado!**\n\n"
+            f"🎟️ Código: `{coupon_code}`\n"
+            f"💸 Desconto: **{discount:g}%**\n"
+            "📦 Produtos: **todos os produtos da loja**\n"
+            f"🔢 Usos: **{uses_text}**\n"
+            f"⏳ Expira: <t:{discord_timestamp}:F> (<t:{discord_timestamp}:R>)",
+            ephemeral=True,
+        )
+
+
 async def setup(bot, admin_check=None):
     global BOT, ADMIN_CHECK
     BOT = bot
@@ -5455,6 +5647,7 @@ async def setup(bot, admin_check=None):
 
     for command_group in (
         CheckoutCommands(),
+        CouponCommands(),
         MisticPayCommands(),
         LockSensiKeysCommands(),
     ):
