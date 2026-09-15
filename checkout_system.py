@@ -59,6 +59,7 @@ def init_db():
     ensure_schema()
     ensure_coupon_schema()
     ensure_split_schema()
+    ensure_affiliate_schema()
     ensure_feedback_schema()
     ensure_license_schema()
 
@@ -348,13 +349,19 @@ def get_generated_key(license_key, guild_id=None):
     return row
 
 
-def _build_expiry(duration_days):
-    days = int(duration_days or 0)
-    if days <= 0:
+def _build_expiry_hours(duration_hours):
+    hours = int(duration_hours or 0)
+    if hours <= 0:
         return None
-    return (datetime.now(timezone.utc) + timedelta(days=days)).strftime(
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
+
+
+def _build_expiry(duration_days):
+    """Compatibilidade: produtos antigos continuam configurados em dias."""
+    days = int(duration_days or 0)
+    return _build_expiry_hours(days * 24)
 
 
 def create_unique_license(prefix):
@@ -835,6 +842,238 @@ def ensure_split_schema():
         con.commit()
     finally:
         con.close()
+
+
+def ensure_affiliate_schema():
+    """Afiliados, seleção por carrinho e terceiro repasse auditável."""
+    con = db()
+    try:
+        con._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS affiliates(
+                id BIGSERIAL PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                discord_user_id BIGINT NOT NULL,
+                display_name TEXT NOT NULL,
+                mistic_email TEXT NOT NULL,
+                commission_percent NUMERIC(5,2) NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_by BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(guild_id, discord_user_id)
+            )
+            """
+        )
+        con._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cart_affiliates(
+                channel_id BIGINT PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                affiliate_id BIGINT NOT NULL REFERENCES affiliates(id),
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        con._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS affiliate_subowners(
+                guild_id BIGINT PRIMARY KEY,
+                mistic_email TEXT NOT NULL,
+                percent NUMERIC(5,2) NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        con._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_affiliates_guild_active
+            ON affiliates(guild_id, active, display_name)
+            """
+        )
+        con._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cart_affiliates_guild_user
+            ON cart_affiliates(guild_id, user_id)
+            """
+        )
+
+        # Snapshot completo no pedido: a venda continua auditável mesmo se a
+        # configuração do streamer mudar no futuro.
+        order_columns = (
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS affiliate_id BIGINT",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS affiliate_user_id BIGINT",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS affiliate_name TEXT",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS affiliate_email TEXT",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS affiliate_percent NUMERIC(5,2) DEFAULT 0",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS affiliate_amount NUMERIC(12,2) DEFAULT 0",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS subowner_email TEXT",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS subowner_percent NUMERIC(5,2) DEFAULT 0",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS subowner_amount NUMERIC(12,2) DEFAULT 0",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS subowner_payout_status TEXT DEFAULT 'not_required'",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS subowner_payout_id TEXT",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS subowner_payout_error TEXT",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS subowner_payout_attempts INTEGER DEFAULT 0",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS subowner_paid_at TIMESTAMP",
+        )
+        for statement in order_columns:
+            con._conn.execute(statement)
+        con.commit()
+    finally:
+        con.close()
+
+
+def _validate_percent(value, label="Porcentagem"):
+    percent = round(float(value or 0), 2)
+    if percent <= 0 or percent >= 100:
+        raise ValueError(f"{label} precisa ser maior que 0 e menor que 100.")
+    return percent
+
+
+def get_affiliates(guild_id, active_only=True):
+    con = db()
+    try:
+        where = "AND active=1" if active_only else ""
+        return con.execute(
+            f"""
+            SELECT * FROM affiliates
+            WHERE guild_id=? {where}
+            ORDER BY lower(display_name), id
+            """,
+            (int(guild_id),),
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def get_affiliate(affiliate_id, guild_id=None):
+    con = db()
+    try:
+        if guild_id is None:
+            return con.execute(
+                "SELECT * FROM affiliates WHERE id=?",
+                (int(affiliate_id),),
+            ).fetchone()
+        return con.execute(
+            "SELECT * FROM affiliates WHERE id=? AND guild_id=?",
+            (int(affiliate_id), int(guild_id)),
+        ).fetchone()
+    finally:
+        con.close()
+
+
+def get_affiliate_by_member(guild_id, discord_user_id):
+    con = db()
+    try:
+        return con.execute(
+            "SELECT * FROM affiliates WHERE guild_id=? AND discord_user_id=?",
+            (int(guild_id), int(discord_user_id)),
+        ).fetchone()
+    finally:
+        con.close()
+
+
+def get_cart_affiliate(channel_id, guild_id=None, user_id=None):
+    con = db()
+    try:
+        row = con.execute(
+            """
+            SELECT a.*
+            FROM cart_affiliates ca
+            JOIN affiliates a ON a.id=ca.affiliate_id
+            WHERE ca.channel_id=?
+              AND a.active=1
+            """,
+            (int(channel_id),),
+        ).fetchone()
+    finally:
+        con.close()
+    if not row:
+        return None
+    if guild_id is not None and int(row["guild_id"]) != int(guild_id):
+        return None
+    # O user_id pertence ao registro do carrinho, não ao afiliado. A validação
+    # de dono é feita antes de chamar esta função nas Views.
+    return row
+
+
+def set_cart_affiliate(channel_id, guild_id, user_id, affiliate_id):
+    affiliate = get_affiliate(affiliate_id, guild_id)
+    if not affiliate or int(affiliate["active"] or 0) != 1:
+        raise ValueError("Afiliado indisponível.")
+    con = db()
+    try:
+        con.execute(
+            """
+            INSERT INTO cart_affiliates(channel_id,guild_id,user_id,affiliate_id,updated_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                guild_id=excluded.guild_id,
+                user_id=excluded.user_id,
+                affiliate_id=excluded.affiliate_id,
+                updated_at=excluded.updated_at
+            """,
+            (int(channel_id), int(guild_id), int(user_id), int(affiliate_id), now_iso()),
+        )
+        con.commit()
+    finally:
+        con.close()
+    return affiliate
+
+
+def clear_cart_affiliate(channel_id):
+    con = db()
+    try:
+        con.execute("DELETE FROM cart_affiliates WHERE channel_id=?", (int(channel_id),))
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_subowner(guild_id):
+    con = db()
+    try:
+        return con.execute(
+            "SELECT * FROM affiliate_subowners WHERE guild_id=? AND active=1",
+            (int(guild_id),),
+        ).fetchone()
+    finally:
+        con.close()
+
+
+def affiliate_split_snapshot(channel_id, guild_id, final_amount):
+    affiliate = get_cart_affiliate(channel_id, guild_id)
+    if not affiliate:
+        return None
+    affiliate_percent = _validate_percent(
+        affiliate["commission_percent"], "Comissão do afiliado"
+    )
+    subowner = get_subowner(guild_id)
+    subowner_percent = (
+        _validate_percent(subowner["percent"], "Porcentagem do subdono")
+        if subowner
+        else 0.0
+    )
+    if subowner and str(subowner["mistic_email"]).strip().lower() == str(
+        affiliate["mistic_email"]
+    ).strip().lower():
+        raise ValueError("Afiliado e subdono não podem usar a mesma conta MisticPay.")
+    if affiliate_percent + subowner_percent >= 100:
+        raise ValueError(
+            "A soma do afiliado e do subdono precisa deixar ao menos 1% para a conta principal."
+        )
+    amount = round(float(final_amount), 2)
+    return {
+        "affiliate": affiliate,
+        "affiliate_percent": affiliate_percent,
+        "affiliate_amount": round(amount * affiliate_percent / 100.0, 2),
+        "subowner": subowner,
+        "subowner_percent": subowner_percent,
+        "subowner_amount": round(amount * subowner_percent / 100.0, 2),
+        "principal_percent": round(100.0 - affiliate_percent - subowner_percent, 2),
+    }
 
 
 def validate_split_email(value):
@@ -1563,11 +1802,18 @@ async def api(method, endpoint, payload=None, guild_id=None, credentials=None):
     if not client_id or not client_secret:
         raise RuntimeError("Credenciais MisticPay não configuradas para este servidor.")
 
-    headers = {
-        "ci": client_id,
-        "cs": client_secret,
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
+    # As chaves novas pk_/sk_ usam HTTP Basic e são necessárias para repasse
+    # interno. As credenciais legadas ci_/cs_ continuam nos dois endpoints
+    # antigos de criar/consultar PIX.
+    if str(client_id).startswith("pk_") and str(client_secret).startswith("sk_"):
+        basic = base64.b64encode(
+            f"{client_id}:{client_secret}".encode("utf-8")
+        ).decode("ascii")
+        headers["Authorization"] = f"Basic {basic}"
+    else:
+        headers["ci"] = client_id
+        headers["cs"] = client_secret
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as sess:
         async with sess.request(
@@ -1634,6 +1880,29 @@ async def create_pix(
         "POST",
         "/transactions/create",
         payload,
+        guild_id=guild_id,
+    )
+
+
+def mistic_supports_internal_payout(guild_id):
+    client_id, client_secret, _source = get_mistic_credentials(guild_id)
+    return str(client_id).startswith("pk_") and str(client_secret).startswith("sk_")
+
+
+async def create_internal_payout(guild_id, email, amount, description):
+    if not mistic_supports_internal_payout(guild_id):
+        raise RuntimeError(
+            "O split de 3 pessoas exige uma Chave de Acesso MisticPay pk_/sk_ "
+            "com permissão cashout. Credenciais ci_/cs_ só suportam o split nativo de 2 contas."
+        )
+    return await api(
+        "POST",
+        "/transactions/withdraw/internal",
+        {
+            "email": validate_split_email(email),
+            "amount": round(float(amount), 2),
+            "description": str(description)[:250],
+        },
         guild_id=guild_id,
     )
 
@@ -1838,6 +2107,177 @@ class CouponModal(discord.ui.Modal, title="Inserir cupom"):
         )
 
 
+def build_affiliates_embed(guild_id, selected_id=None, page=0, page_size=20):
+    rows = get_affiliates(guild_id)
+    pages = max(1, math.ceil(len(rows) / page_size))
+    page = max(0, min(int(page), pages - 1))
+    start = page * page_size
+    visible = rows[start : start + page_size]
+    lines = []
+    for row in visible:
+        mark = "✅" if selected_id and int(row["id"]) == int(selected_id) else "▫️"
+        lines.append(
+            f"{mark} <@{row['discord_user_id']}> • "
+            f"**{float(row['commission_percent']):g}%**"
+        )
+    description = (
+        "Selecione quem indicou esta compra. A escolha ficará registrada no pedido.\n\n"
+        + ("\n".join(lines) if lines else "Nenhum afiliado cadastrado neste servidor.")
+    )
+    embed = discord.Embed(
+        title="🤝 Afiliados • Lock Sensi",
+        description=description[:4000],
+        color=0xE31B2B,
+    )
+    embed.set_footer(text=f"Página {page + 1}/{pages} • {len(rows)} afiliado(s)")
+    return embed, rows, page, pages
+
+
+class AffiliateSelect(discord.ui.Select):
+    def __init__(self, owner_view, visible_rows, selected_id=None):
+        self.owner_view = owner_view
+        options = []
+        for row in visible_rows[:25]:
+            options.append(
+                discord.SelectOption(
+                    label=str(row["display_name"])[:100],
+                    description=f"Comissão: {float(row['commission_percent']):g}%",
+                    value=str(row["id"]),
+                    emoji="📣",
+                    default=bool(selected_id and int(row["id"]) == int(selected_id)),
+                )
+            )
+        if not options:
+            options.append(
+                discord.SelectOption(
+                    label="Nenhum afiliado disponível",
+                    value="none",
+                    emoji="⚠️",
+                )
+            )
+        super().__init__(
+            placeholder="Selecione quem indicou você...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, i: discord.Interaction):
+        if i.user.id != self.owner_view.uid:
+            await i.response.send_message("Carrinho de outra pessoa.", ephemeral=True)
+            return
+        if self.values[0] == "none":
+            await i.response.send_message("❌ Nenhum afiliado cadastrado.", ephemeral=True)
+            return
+        try:
+            candidate = get_affiliate(int(self.values[0]), i.guild.id)
+            if candidate and int(candidate["discord_user_id"]) == int(i.user.id):
+                await i.response.send_message(
+                    "❌ Você não pode atribuir sua própria compra a você mesmo.",
+                    ephemeral=True,
+                )
+                return
+            affiliate = set_cart_affiliate(
+                self.owner_view.channel_id,
+                i.guild.id,
+                i.user.id,
+                int(self.values[0]),
+            )
+        except Exception as exc:
+            await i.response.send_message(f"❌ {str(exc)[:300]}", ephemeral=True)
+            return
+        embed, _rows, page, _pages = build_affiliates_embed(
+            i.guild.id,
+            selected_id=affiliate["id"],
+            page=self.owner_view.page,
+        )
+        await i.response.edit_message(
+            embed=embed,
+            view=AffiliatePickerView(
+                i.guild.id,
+                self.owner_view.channel_id,
+                self.owner_view.uid,
+                page=page,
+            ),
+        )
+
+
+class AffiliatePickerView(discord.ui.View):
+    def __init__(self, guild_id, channel_id, uid, page=0):
+        super().__init__(timeout=600)
+        self.guild_id = int(guild_id)
+        self.channel_id = int(channel_id)
+        self.uid = int(uid)
+        current = get_cart_affiliate(channel_id, guild_id)
+        self.selected_id = int(current["id"]) if current else None
+        _embed, rows, self.page, self.pages = build_affiliates_embed(
+            guild_id, self.selected_id, page
+        )
+        start = self.page * 20
+        self.add_item(AffiliateSelect(self, rows[start : start + 20], self.selected_id))
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = self.page >= self.pages - 1
+
+    async def _turn_page(self, i, page):
+        embed, _rows, page, _pages = build_affiliates_embed(
+            self.guild_id, self.selected_id, page
+        )
+        await i.response.edit_message(
+            embed=embed,
+            view=AffiliatePickerView(
+                self.guild_id, self.channel_id, self.uid, page=page
+            ),
+        )
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, i, b):
+        if i.user.id != self.uid:
+            await i.response.send_message("Carrinho de outra pessoa.", ephemeral=True)
+            return
+        await self._turn_page(i, self.page - 1)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, i, b):
+        if i.user.id != self.uid:
+            await i.response.send_message("Carrinho de outra pessoa.", ephemeral=True)
+            return
+        await self._turn_page(i, self.page + 1)
+
+    @discord.ui.button(
+        label="Remover indicação", style=discord.ButtonStyle.danger, row=1
+    )
+    async def remove(self, i, b):
+        if i.user.id != self.uid:
+            await i.response.send_message("Carrinho de outra pessoa.", ephemeral=True)
+            return
+        clear_cart_affiliate(self.channel_id)
+        embed, _rows, page, _pages = build_affiliates_embed(
+            self.guild_id, None, self.page
+        )
+        await i.response.edit_message(
+            embed=embed,
+            view=AffiliatePickerView(
+                self.guild_id, self.channel_id, self.uid, page=page
+            ),
+        )
+
+
+async def open_affiliate_picker(i, pid, uid):
+    if i.user.id != uid:
+        await i.response.send_message("Carrinho de outra pessoa.", ephemeral=True)
+        return
+    current = get_cart_affiliate(i.channel.id, i.guild.id)
+    selected_id = int(current["id"]) if current else None
+    embed, _rows, page, _pages = build_affiliates_embed(
+        i.guild.id, selected_id, 0
+    )
+    await i.response.send_message(
+        embed=embed,
+        view=AffiliatePickerView(i.guild.id, i.channel.id, uid, page),
+        ephemeral=True,
+    )
+
+
 class CartItemView(discord.ui.View):
     def __init__(self, pid, uid):
         super().__init__(timeout=1800)
@@ -1861,6 +2301,10 @@ class CartItemView(discord.ui.View):
             )
         )
 
+    @discord.ui.button(label="🤝 Afiliados", style=discord.ButtonStyle.secondary)
+    async def affiliate(self, i, b):
+        await open_affiliate_picker(i, self.pid, self.uid)
+
 
 class StartView(discord.ui.View):
     def __init__(self, pid, uid):
@@ -1883,6 +2327,16 @@ class StartView(discord.ui.View):
         p = get_product(self.pid)
         pricing = get_cart_pricing(i.channel.id, i.guild.id, p["price"])
         e = build_summary_embed(p, pricing)
+        affiliate = get_cart_affiliate(i.channel.id, i.guild.id)
+        if affiliate:
+            e.add_field(
+                name="🤝 Afiliado selecionado",
+                value=(
+                    f"<@{affiliate['discord_user_id']}> • "
+                    f"{float(affiliate['commission_percent']):g}%"
+                ),
+                inline=False,
+            )
         await i.response.send_message(
             embed=e,
             view=SummaryView(self.pid, self.uid),
@@ -1893,6 +2347,7 @@ class StartView(discord.ui.View):
         if not await self.ok(i):
             return
         clear_cart_coupon(i.channel.id)
+        clear_cart_affiliate(i.channel.id)
         await i.response.send_message("Compra cancelada. Canal será apagado.")
         await asyncio.sleep(4)
         try:
@@ -1955,6 +2410,13 @@ class SummaryView(discord.ui.View):
             value=f"**{money(pricing['final'])}**",
             inline=False,
         )
+        affiliate = get_cart_affiliate(i.channel.id, i.guild.id)
+        if affiliate:
+            e.add_field(
+                name="🤝 Afiliado selecionado",
+                value=f"<@{affiliate['discord_user_id']}> • indicação registrada",
+                inline=False,
+            )
         await i.response.send_message(
             embed=e,
             view=PaymentView(self.pid, self.uid),
@@ -1974,12 +2436,17 @@ class SummaryView(discord.ui.View):
             )
         )
 
+    @discord.ui.button(label="🤝 Afiliados", style=discord.ButtonStyle.secondary)
+    async def affiliate(self, i, b):
+        await open_affiliate_picker(i, self.pid, self.uid)
+
     @discord.ui.button(label="❌ Cancelar Compra", style=discord.ButtonStyle.danger)
     async def cancel(self, i, b):
         if i.user.id != self.uid:
             await i.response.send_message("Carrinho de outra pessoa.", ephemeral=True)
             return
         clear_cart_coupon(i.channel.id)
+        clear_cart_affiliate(i.channel.id)
         await i.response.send_message("Compra cancelada.")
         await asyncio.sleep(3)
         try:
@@ -2008,6 +2475,8 @@ class PaymentView(discord.ui.View):
         if i.user.id != self.uid:
             await i.response.send_message("Carrinho de outra pessoa.", ephemeral=True)
             return
+        clear_cart_coupon(i.channel.id)
+        clear_cart_affiliate(i.channel.id)
         await i.response.send_message("Cancelado.")
         await asyncio.sleep(3)
         try:
@@ -2055,11 +2524,14 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
         pricing = get_cart_pricing(i.channel.id, i.guild.id, p["price"])
         final_amount = pricing["final"]
 
-        # Por padrão: 100% cai na MisticPay conectada ao servidor.
-        # Somente produtos marcados com split enviam uma porcentagem
-        # para a outra conta MisticPay.
+        # Sem afiliado, preserva exatamente o split antigo de duas contas.
+        # Com afiliado, o split nativo envia a comissão ao streamer. Se houver
+        # subdono, o segundo repasse acontece após a confirmação do pagamento.
         try:
-            split = get_product_split(p)
+            affiliate_split = affiliate_split_snapshot(
+                i.channel.id, i.guild.id, final_amount
+            )
+            split = None if affiliate_split else get_product_split(p)
         except ValueError as exc:
             await i.followup.send(
                 f"❌ O split deste produto está configurado incorretamente: `{exc}`\n"
@@ -2068,11 +2540,37 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
             )
             return
 
-        split_user = split["user"] if split else None
-        split_tax = split["tax"] if split else 0.0
-        split_amount = round(final_amount * split_tax / 100.0, 2) if split else 0.0
-        split_source = split.get("source") if split else "nenhum"
-        split_group = split.get("group") if split else None
+        if affiliate_split:
+            affiliate = affiliate_split["affiliate"]
+            subowner = affiliate_split["subowner"]
+            split_user = str(affiliate["mistic_email"])
+            split_tax = affiliate_split["affiliate_percent"]
+            split_amount = affiliate_split["affiliate_amount"]
+            split_source = "afiliado"
+            split_group = str(affiliate["display_name"])
+            subowner_email = str(subowner["mistic_email"]) if subowner else None
+            subowner_percent = affiliate_split["subowner_percent"]
+            subowner_amount = affiliate_split["subowner_amount"]
+            if subowner and not mistic_supports_internal_payout(i.guild.id):
+                await i.followup.send(
+                    "❌ O modo de **3 participantes** está configurado, mas a conta "
+                    "MisticPay usa credenciais antigas. Conecte uma Chave de Acesso "
+                    "`pk_`/`sk_` com permissão **cashout**. Nenhum PIX foi criado.",
+                    ephemeral=True,
+                )
+                return
+        else:
+            affiliate = None
+            split_user = split["user"] if split else None
+            split_tax = split["tax"] if split else 0.0
+            split_amount = (
+                round(final_amount * split_tax / 100.0, 2) if split else 0.0
+            )
+            split_source = split.get("source") if split else "nenhum"
+            split_group = split.get("group") if split else None
+            subowner_email = None
+            subowner_percent = 0.0
+            subowner_amount = 0.0
 
         # Se existe cupom, reserva 1 utilização antes de criar o PIX.
         coupon_reserved = False
@@ -2101,9 +2599,13 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
                 guild_id,user_id,product_id,product_name,amount,
                 original_amount,coupon_code,coupon_percent,discount_amount,
                 split_user,split_tax,split_amount,split_source,split_group,
+                affiliate_id,affiliate_user_id,affiliate_name,affiliate_email,
+                affiliate_percent,affiliate_amount,
+                subowner_email,subowner_percent,subowner_amount,
+                subowner_payout_status,
                 status,code,payer_name,payer_document,payer_email,
                 cart_channel_id,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
                 (
                     i.guild.id,
@@ -2120,6 +2622,16 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
                     split_amount,
                     split_source,
                     split_group,
+                    int(affiliate["id"]) if affiliate else None,
+                    int(affiliate["discord_user_id"]) if affiliate else None,
+                    str(affiliate["display_name"]) if affiliate else None,
+                    str(affiliate["mistic_email"]) if affiliate else None,
+                    split_tax if affiliate else 0.0,
+                    split_amount if affiliate else 0.0,
+                    subowner_email,
+                    subowner_percent,
+                    subowner_amount,
+                    "pending" if subowner_amount > 0 else "not_required",
                     "pendente",
                     local,
                     str(self.name),
@@ -2139,7 +2651,7 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
         finally:
             con.close()
 
-        if split:
+        if split or affiliate_split:
             print(
                 f"[SPLIT] pedido=#{oid} produto=#{_row_value(p, 'local_id', '?')} "
                 f"fonte={split_source} grupo={split_group or '-'} tax={split_tax:g}% "
@@ -2162,7 +2674,7 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
                 f"EA-{oid}-{local}",
                 f"{p['name']} - Discord {i.user.id}",
                 split_user=split_user,
-                split_tax=split_tax if split else None,
+                split_tax=split_tax if (split or affiliate_split) else None,
             )
             data = res.get("data") or {}
             tid = str(data.get("transactionId") or "")
@@ -2219,7 +2731,22 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
                 value=f"**{money(final_amount)}**",
                 inline=False,
             )
-            if split:
+            if affiliate_split:
+                e.add_field(
+                    name="🤝 Divisão por afiliado",
+                    value=(
+                        f"Conta principal: **{affiliate_split['principal_percent']:g}%**\n"
+                        f"Afiliado <@{affiliate['discord_user_id']}>: **{split_tax:g}%**\n"
+                        + (
+                            f"Subdono: **{subowner_percent:g}%**\n"
+                            "Repasse do subdono: **automático após confirmação**"
+                            if subowner_amount > 0
+                            else "Subdono: **não configurado**"
+                        )
+                    ),
+                    inline=False,
+                )
+            elif split:
                 e.add_field(
                     name="🤝 Divisão automática",
                     value=(
@@ -2307,11 +2834,103 @@ class VerifyView(discord.ui.View):
         await i.response.send_message(f"```{pix_code[:1900]}```", ephemeral=True)
 
 
+async def process_subowner_payout(oid):
+    """Faz o terceiro repasse uma única vez, com claim atômico no banco."""
+    order = get_order(oid)
+    if not order or str(order["status"]) != "aprovado":
+        return False, "pedido ainda não aprovado"
+    if int(_row_value(order, "is_test", 0) or 0) == 1:
+        return False, "pedido de teste"
+    amount = round(float(_row_value(order, "subowner_amount", 0) or 0), 2)
+    email = str(_row_value(order, "subowner_email", "") or "").strip()
+    status = str(
+        _row_value(order, "subowner_payout_status", "not_required")
+        or "not_required"
+    )
+    if not email or amount <= 0 or status == "not_required":
+        return False, "sem terceiro repasse"
+    if status == "paid":
+        return True, "terceiro repasse já realizado"
+
+    con = db()
+    try:
+        claimed = con.execute(
+            """
+            UPDATE orders
+            SET subowner_payout_status='processing',
+                subowner_payout_attempts=COALESCE(subowner_payout_attempts,0)+1,
+                subowner_payout_error=NULL,
+                updated_at=?
+            WHERE id=?
+              AND subowner_payout_status IN ('pending','failed')
+              AND COALESCE(subowner_payout_attempts,0)<5
+            RETURNING *
+            """,
+            (now_iso(), int(oid)),
+        ).fetchone()
+        con.commit()
+    finally:
+        con.close()
+    if not claimed:
+        return False, "repasse já está sendo processado ou excedeu as tentativas"
+
+    try:
+        result = await create_internal_payout(
+            int(claimed["guild_id"]),
+            email,
+            amount,
+            f"Subdono pedido #{oid} - {claimed['product_name']}",
+        )
+        data = result.get("data") or result
+        payout_id = str(
+            data.get("transactionId") or data.get("jobId") or data.get("id") or ""
+        )
+        con = db()
+        try:
+            con.execute(
+                """
+                UPDATE orders
+                SET subowner_payout_status='paid',subowner_payout_id=?,
+                    subowner_payout_error=NULL,subowner_paid_at=?,updated_at=?
+                WHERE id=? AND subowner_payout_status='processing'
+                """,
+                (payout_id, now_iso(), now_iso(), int(oid)),
+            )
+            con.commit()
+        finally:
+            con.close()
+        print(
+            f"[AFILIADO] pedido=#{oid} terceiro_repasse=paid "
+            f"destino={mask_split_email(email)} valor={money(amount)} id={payout_id or '-'}",
+            flush=True,
+        )
+        return True, "terceiro repasse realizado"
+    except Exception as exc:
+        error = str(exc)[:800]
+        con = db()
+        try:
+            con.execute(
+                """
+                UPDATE orders
+                SET subowner_payout_status='failed',subowner_payout_error=?,updated_at=?
+                WHERE id=? AND subowner_payout_status='processing'
+                """,
+                (error, now_iso(), int(oid)),
+            )
+            con.commit()
+        finally:
+            con.close()
+        print(f"[AFILIADO] pedido=#{oid} terceiro_repasse=failed erro={error}", flush=True)
+        return False, error
+
+
 async def verify(oid, force=False):
     o = get_order(oid)
     if not o:
         return False, "Pedido não encontrado."
     if o["status"] == "aprovado":
+        if not force:
+            await process_subowner_payout(oid)
         return True, "✅ Pedido já aprovado."
     if force:
         state = "COMPLETO"
@@ -2326,7 +2945,9 @@ async def verify(oid, force=False):
         return False, f"🟡 Ainda aguardando. Status: **{state or 'PENDENTE'}**."
     con = db()
     cur = con.cursor()
-    current = cur.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    current = cur.execute(
+        "SELECT * FROM orders WHERE id=? FOR UPDATE", (oid,)
+    ).fetchone()
     if current["status"] == "aprovado":
         con.close()
         return True, "✅ Já processado."
@@ -2341,6 +2962,8 @@ async def verify(oid, force=False):
         )
     con.commit()
     con.close()
+    if not force:
+        await process_subowner_payout(oid)
     await deliver(oid)
     return True, "✅ Pagamento confirmado! Entrega enviada no privado."
 
@@ -2913,6 +3536,27 @@ async def deliver(oid):
                 ),
                 view=SaleView(o["guild_id"]),
             )
+            if _row_value(o, "affiliate_id"):
+                affiliate_log = discord.Embed(
+                    title="🤝 Venda atribuída a afiliado",
+                    description=(
+                        f"🧾 Pedido: `#{oid}`\n"
+                        f"🛒 Comprador: {member.mention}\n"
+                        f"📣 Afiliado: <@{o['affiliate_user_id']}> "
+                        f"(**{o['affiliate_name']}**)\n"
+                        f"💸 Comissão: **{float(o['affiliate_percent'] or 0):g}%** "
+                        f"({money(o['affiliate_amount'])})\n"
+                        + (
+                            f"👑 Subdono: **{float(o['subowner_percent'] or 0):g}%** "
+                            f"({money(o['subowner_amount'])}) • "
+                            f"status `{o['subowner_payout_status']}`"
+                            if float(_row_value(o, "subowner_amount", 0) or 0) > 0
+                            else "👑 Subdono: **não usado nesta venda**"
+                        )
+                    ),
+                    color=0xE31B2B,
+                )
+                await ch.send(embed=affiliate_log)
         except Exception as exc:
             print(f"Erro ao enviar card da venda #{oid}: {exc}")
     elif guild:
@@ -2933,6 +3577,7 @@ async def deliver(oid):
                 )
                 await asyncio.sleep(20)
                 clear_cart_coupon(cc.id)
+                clear_cart_affiliate(cc.id)
                 await cc.delete()
             except:
                 pass
@@ -2949,6 +3594,34 @@ async def watcher():
             con.close()
             for r in rows:
                 await verify(r["id"])
+                await asyncio.sleep(1.05)
+
+            # Se o processo reiniciar no meio de um repasse, libera o claim
+            # antigo e tenta novamente. Cada pedido tem no máximo 5 tentativas.
+            con = db()
+            con.execute(
+                """
+                UPDATE orders
+                SET subowner_payout_status='failed',
+                    subowner_payout_error='Processamento interrompido; nova tentativa agendada'
+                WHERE subowner_payout_status='processing'
+                  AND updated_at < NOW() - INTERVAL '10 minutes'
+                """
+            )
+            payout_rows = con.execute(
+                """
+                SELECT id FROM orders
+                WHERE status='aprovado'
+                  AND subowner_payout_status IN ('pending','failed')
+                  AND COALESCE(subowner_payout_attempts,0)<5
+                ORDER BY id ASC
+                LIMIT 20
+                """
+            ).fetchall()
+            con.commit()
+            con.close()
+            for r in payout_rows:
+                await process_subowner_payout(r["id"])
                 await asyncio.sleep(1.05)
         except Exception as e:
             print("Mistic watcher:", e)
@@ -3132,7 +3805,7 @@ async def require_manual_key_permission(interaction):
     return False
 
 
-def create_manual_license(product, guild_id, user_id):
+def create_manual_license(product, guild_id, user_id, duration_hours=None):
     """
     Cria uma key sem compra/pedido.
     Usa um order_id NEGATIVO reservado para geração manual.
@@ -3142,7 +3815,13 @@ def create_manual_license(product, guild_id, user_id):
         raise RuntimeError("Este produto não está com geração de keys ativada.")
 
     license_key = create_unique_license(benefits["prefix"])
-    expires_at = _build_expiry(benefits["duration_days"])
+    if duration_hours is None:
+        expires_at = _build_expiry(benefits["duration_days"])
+    else:
+        duration_hours = int(duration_hours)
+        if duration_hours < 1 or duration_hours > 24 * 36500:
+            raise ValueError("Use entre 1 e 876000 horas.")
+        expires_at = _build_expiry_hours(duration_hours)
 
     # Negativo para nunca colidir com IDs normais de pedidos.
     # Faz algumas tentativas em caso de concorrência extrema.
@@ -3204,12 +3883,14 @@ class LockSensiKeysCommands(app_commands.Group):
     @app_commands.describe(
         produto_id="ID local do produto mostrado em /loja produtos",
         usuario="Cliente que será dono da key (opcional)",
+        horas="Validade desta key em horas. Ex: 1, 6, 12 ou 24",
     )
     async def generate_manual_key(
         self,
         i: discord.Interaction,
         produto_id: int,
         usuario: Optional[discord.Member] = None,
+        horas: Optional[int] = None,
     ):
         # Esta permissão é propositalmente independente do ADMIN_CHECK:
         # só os dois cargos definidos acima OU o owner podem gerar key manual.
@@ -3250,6 +3931,7 @@ class LockSensiKeysCommands(app_commands.Group):
                 product,
                 i.guild.id,
                 target.id,
+                duration_hours=horas,
             )
         except Exception as exc:
             await i.response.send_message(
@@ -3270,6 +3952,7 @@ class LockSensiKeysCommands(app_commands.Group):
                 f"📦 Produto: **{product['name']}** (`#{produto_id}`)\n"
                 f"👤 Cliente: {target.mention} (`{target.id}`)\n"
                 f"⏳ Validade: **{validade}**\n"
+                f"🕐 Duração escolhida: **{str(horas) + ' hora(s)' if horas else 'padrão do produto'}**\n"
                 f"💻 HWID: **{'1 PC' if benefits['hwid_required'] else 'desativado'}**\n"
                 f"🔒 App: `{app_code}`\n\n"
                 f"**Key:**\n```{result['license_key']}```"
@@ -5515,6 +6198,424 @@ class CheckoutCommands(app_commands.Group):
         )
 
 
+def get_streamer_dashboard(guild_id, discord_user_id):
+    affiliate = get_affiliate_by_member(guild_id, discord_user_id)
+    if not affiliate:
+        return None, None
+    con = db()
+    try:
+        stats = con.execute(
+            """
+            SELECT
+                COUNT(*) AS sales_count,
+                COUNT(DISTINCT user_id) AS unique_buyers,
+                COALESCE(SUM(amount),0) AS gross_total,
+                COALESCE(SUM(affiliate_amount),0) AS commission_total,
+                MAX(paid_at) AS last_sale
+            FROM orders
+            WHERE guild_id=?
+              AND affiliate_user_id=?
+              AND status='aprovado'
+              AND COALESCE(is_test,0)=0
+            """,
+            (int(guild_id), int(discord_user_id)),
+        ).fetchone()
+    finally:
+        con.close()
+    return affiliate, stats
+
+
+def build_streamer_dashboard_embed(guild, member):
+    affiliate, stats = get_streamer_dashboard(guild.id, member.id)
+    if not affiliate:
+        return None
+    sales_count = int(_row_value(stats, "sales_count", 0) or 0)
+    unique_buyers = int(_row_value(stats, "unique_buyers", 0) or 0)
+    gross_total = float(_row_value(stats, "gross_total", 0) or 0)
+    commission_total = float(_row_value(stats, "commission_total", 0) or 0)
+    last_sale = _parse_db_datetime(_row_value(stats, "last_sale"))
+    last_sale_text = (
+        f"<t:{int(last_sale.timestamp())}:R>" if last_sale else "Nenhuma ainda"
+    )
+    active = int(affiliate["active"] or 0) == 1
+    embed = discord.Embed(
+        title=f"📊 Painel Streamer • {affiliate['display_name']}",
+        description=(
+            f"📣 Resultados públicos das compras atribuídas a {member.mention}.\n"
+            "Os números consideram somente pagamentos reais confirmados."
+        ),
+        color=0xE31B2B,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="🛒 Compras", value=f"**{sales_count}**", inline=True)
+    embed.add_field(name="👥 Clientes únicos", value=f"**{unique_buyers}**", inline=True)
+    embed.add_field(name="💵 Valor gerado", value=f"**{money(gross_total)}**", inline=True)
+    embed.add_field(
+        name="💸 Comissão do streamer",
+        value=f"**{money(commission_total)}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="📈 Comissão atual",
+        value=f"**{float(affiliate['commission_percent']):g}%**",
+        inline=True,
+    )
+    embed.add_field(name="🕐 Última compra", value=last_sale_text, inline=True)
+    embed.add_field(
+        name="🔎 Status",
+        value="🟢 Afiliado ativo" if active else "🔴 Afiliado desativado",
+        inline=False,
+    )
+    try:
+        embed.set_thumbnail(url=member.display_avatar.url)
+    except Exception:
+        pass
+    embed.set_footer(text="LOCK SENSI • Painel de Afiliados • Atualização ao vivo")
+    return embed
+
+
+class StreamerDashboardView(discord.ui.View):
+    def __init__(self, guild_id, streamer_user_id):
+        super().__init__(timeout=3600)
+        self.guild_id = int(guild_id)
+        self.streamer_user_id = int(streamer_user_id)
+
+    @discord.ui.button(
+        label="Atualizar painel",
+        emoji="🔄",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def refresh(self, i: discord.Interaction, b):
+        guild = i.client.get_guild(self.guild_id) or i.guild
+        member = guild.get_member(self.streamer_user_id) if guild else None
+        if guild and not member:
+            try:
+                member = await guild.fetch_member(self.streamer_user_id)
+            except Exception:
+                member = None
+        if not guild or not member:
+            await i.response.send_message(
+                "❌ Não consegui localizar esse streamer.", ephemeral=True
+            )
+            return
+        embed = build_streamer_dashboard_embed(guild, member)
+        if not embed:
+            await i.response.send_message(
+                "❌ Esse usuário não está cadastrado como afiliado.", ephemeral=True
+            )
+            return
+        await i.response.edit_message(
+            embed=embed,
+            view=StreamerDashboardView(self.guild_id, self.streamer_user_id),
+        )
+
+
+class AffiliateCommands(app_commands.Group):
+    def __init__(self):
+        super().__init__(
+            name="afiliado",
+            description="Streamers, indicações e comissões Lock Sensi",
+        )
+
+    @app_commands.command(
+        name="cadastrar",
+        description="Cadastra ou atualiza um streamer afiliado",
+    )
+    @app_commands.describe(
+        usuario="Streamer do Discord",
+        email="E-mail da conta MisticPay do streamer",
+        porcentagem="Comissão em cada venda indicada. Ex: 10",
+        nome="Nome exibido no painel (opcional)",
+    )
+    async def register(
+        self,
+        i: discord.Interaction,
+        usuario: discord.Member,
+        email: str,
+        porcentagem: float,
+        nome: Optional[str] = None,
+    ):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+        try:
+            email = validate_split_email(email)
+            porcentagem = _validate_percent(porcentagem, "Comissão")
+        except ValueError as exc:
+            await i.response.send_message(f"❌ {exc}", ephemeral=True)
+            return
+        subowner = get_subowner(i.guild.id)
+        if subowner and porcentagem + float(subowner["percent"] or 0) >= 100:
+            await i.response.send_message(
+                "❌ Comissão do afiliado + porcentagem do subdono precisa "
+                "deixar ao menos 1% para a conta principal.",
+                ephemeral=True,
+            )
+            return
+        display_name = re.sub(r"\s+", " ", str(nome or usuario.display_name)).strip()
+        if not display_name:
+            display_name = usuario.display_name
+        con = db()
+        try:
+            con.execute(
+                """
+                INSERT INTO affiliates(
+                    guild_id,discord_user_id,display_name,mistic_email,
+                    commission_percent,active,created_by,created_at,updated_at
+                ) VALUES(?,?,?,?,?,1,?,?,?)
+                ON CONFLICT(guild_id,discord_user_id) DO UPDATE SET
+                    display_name=excluded.display_name,
+                    mistic_email=excluded.mistic_email,
+                    commission_percent=excluded.commission_percent,
+                    active=1,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    i.guild.id,
+                    usuario.id,
+                    display_name[:100],
+                    email,
+                    porcentagem,
+                    i.user.id,
+                    now_iso(),
+                    now_iso(),
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+        await i.response.send_message(
+            "✅ **Afiliado cadastrado.**\n"
+            f"📣 Streamer: {usuario.mention}\n"
+            f"🏷️ Nome no painel: **{display_name[:100]}**\n"
+            f"💸 Comissão: **{porcentagem:g}%**\n"
+            f"🏦 MisticPay: `{mask_split_email(email)}`",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="remover", description="Desativa um streamer afiliado")
+    async def remove(self, i: discord.Interaction, usuario: discord.Member):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+        con = db()
+        try:
+            cur = con.execute(
+                """
+                UPDATE affiliates SET active=0,updated_at=?
+                WHERE guild_id=? AND discord_user_id=? AND active=1
+                """,
+                (now_iso(), i.guild.id, usuario.id),
+            )
+            removed = int(getattr(cur, "rowcount", 0) or 0)
+            con.execute(
+                """
+                DELETE FROM cart_affiliates
+                WHERE affiliate_id IN (
+                    SELECT id FROM affiliates
+                    WHERE guild_id=? AND discord_user_id=?
+                )
+                """,
+                (i.guild.id, usuario.id),
+            )
+            con.commit()
+        finally:
+            con.close()
+        await i.response.send_message(
+            "✅ Afiliado removido do painel."
+            if removed
+            else "⚠️ Esse usuário não era um afiliado ativo.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="listar", description="Mostra os afiliados cadastrados")
+    async def list_affiliates(self, i: discord.Interaction):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+        rows = get_affiliates(i.guild.id)
+        lines = [
+            f"📣 <@{row['discord_user_id']}> • **{row['display_name']}** • "
+            f"**{float(row['commission_percent']):g}%** • "
+            f"`{mask_split_email(row['mistic_email'])}`"
+            for row in rows
+        ]
+        subowner = get_subowner(i.guild.id)
+        sub_text = (
+            f"Ativo • **{float(subowner['percent']):g}%** • "
+            f"`{mask_split_email(subowner['mistic_email'])}`"
+            if subowner
+            else "Desativado"
+        )
+        await i.response.send_message(
+            embed=discord.Embed(
+                title="🤝 Afiliados cadastrados",
+                description=(
+                    ("\n".join(lines) if lines else "Nenhum afiliado cadastrado.")
+                    + f"\n\n**Terceiro participante (subdono):** {sub_text}"
+                )[:4000],
+                color=0xE31B2B,
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="subdono-configurar",
+        description="Ativa o terceiro participante nas vendas com afiliado",
+    )
+    @app_commands.describe(
+        email="E-mail MisticPay do subdono",
+        porcentagem="Parte do valor bruto enviada após confirmação",
+    )
+    async def configure_subowner(
+        self, i: discord.Interaction, email: str, porcentagem: float
+    ):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+        try:
+            email = validate_split_email(email)
+            porcentagem = _validate_percent(porcentagem, "Porcentagem do subdono")
+        except ValueError as exc:
+            await i.response.send_message(f"❌ {exc}", ephemeral=True)
+            return
+        affiliates = get_affiliates(i.guild.id)
+        invalid = [
+            row for row in affiliates
+            if float(row["commission_percent"] or 0) + porcentagem >= 100
+        ]
+        if invalid:
+            await i.response.send_message(
+                "❌ Essa porcentagem não deixa 1% para a conta principal em "
+                f"**{len(invalid)} afiliado(s)**. Reduza o valor.",
+                ephemeral=True,
+            )
+            return
+        if not mistic_supports_internal_payout(i.guild.id):
+            await i.response.send_message(
+                "❌ Para três participantes, conecte uma Chave de Acesso "
+                "MisticPay `pk_`/`sk_` com permissão **cashout**. "
+                "O split antigo de duas contas continua funcionando com `ci_`/`cs_`.",
+                ephemeral=True,
+            )
+            return
+        con = db()
+        try:
+            con.execute(
+                """
+                INSERT INTO affiliate_subowners(guild_id,mistic_email,percent,active,updated_at)
+                VALUES(?,?,?,1,?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    mistic_email=excluded.mistic_email,
+                    percent=excluded.percent,
+                    active=1,
+                    updated_at=excluded.updated_at
+                """,
+                (i.guild.id, email, porcentagem, now_iso()),
+            )
+            con.commit()
+        finally:
+            con.close()
+        await i.response.send_message(
+            "✅ **Modo de três participantes ativado nas vendas com afiliado.**\n"
+            f"👑 Subdono: `{mask_split_email(email)}` • **{porcentagem:g}%**\n"
+            "📣 A porcentagem do streamer depende do afiliado escolhido.\n"
+            "🏦 A conta principal recebe o restante.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="subdono-remover",
+        description="Volta as vendas de afiliado para o split de duas contas",
+    )
+    async def remove_subowner(self, i: discord.Interaction):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+        con = db()
+        try:
+            cur = con.execute(
+                "UPDATE affiliate_subowners SET active=0,updated_at=? WHERE guild_id=? AND active=1",
+                (now_iso(), i.guild.id),
+            )
+            changed = int(getattr(cur, "rowcount", 0) or 0)
+            con.commit()
+        finally:
+            con.close()
+        await i.response.send_message(
+            "✅ Subdono desativado. O split de duas contas foi mantido."
+            if changed
+            else "⚠️ O subdono já estava desativado.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="vendas",
+        description="Mostra vendas atribuídas a um streamer",
+    )
+    async def sales(
+        self, i: discord.Interaction, usuario: Optional[discord.Member] = None
+    ):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+        con = db()
+        try:
+            params = [i.guild.id]
+            member_filter = ""
+            if usuario:
+                member_filter = "AND affiliate_user_id=?"
+                params.append(usuario.id)
+            rows = con.execute(
+                f"""
+                SELECT affiliate_user_id,affiliate_name,
+                       COUNT(*) AS sales_count,
+                       COALESCE(SUM(amount),0) AS gross_total,
+                       COALESCE(SUM(affiliate_amount),0) AS commission_total
+                FROM orders
+                WHERE guild_id=? AND status='aprovado' AND COALESCE(is_test,0)=0
+                  AND affiliate_id IS NOT NULL {member_filter}
+                GROUP BY affiliate_user_id,affiliate_name
+                ORDER BY commission_total DESC
+                LIMIT 50
+                """,
+                tuple(params),
+            ).fetchall()
+        finally:
+            con.close()
+        lines = [
+            f"<@{row['affiliate_user_id']}> • **{row['sales_count']} venda(s)** • "
+            f"bruto {money(row['gross_total'])} • comissão {money(row['commission_total'])}"
+            for row in rows
+        ]
+        await i.response.send_message(
+            embed=discord.Embed(
+                title="📊 Vendas por afiliado",
+                description=("\n".join(lines) or "Nenhuma venda afiliada aprovada.")[:4000],
+                color=0xE31B2B,
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="painel-streamer",
+        description="Publica seu dashboard de vendas e comissão no canal",
+    )
+    async def streamer_panel(self, i: discord.Interaction):
+        if not i.guild:
+            await i.response.send_message(
+                "❌ Use este comando dentro do servidor.", ephemeral=True
+            )
+            return
+        embed = build_streamer_dashboard_embed(i.guild, i.user)
+        if not embed:
+            await i.response.send_message(
+                "❌ Você ainda não está cadastrado como streamer afiliado. "
+                "Peça para um administrador usar `/afiliado cadastrar`.",
+                ephemeral=True,
+            )
+            return
+        # Resposta normal: o painel fica no chat e todos conseguem visualizar.
+        await i.response.send_message(
+            embed=embed,
+            view=StreamerDashboardView(i.guild.id, i.user.id),
+        )
+
+
 class CouponCommands(app_commands.Group):
     def __init__(self):
         super().__init__(name="cupom", description="Cupons gerais da loja")
@@ -5648,6 +6749,7 @@ async def setup(bot, admin_check=None):
     for command_group in (
         CheckoutCommands(),
         CouponCommands(),
+        AffiliateCommands(),
         MisticPayCommands(),
         LockSensiKeysCommands(),
     ):
