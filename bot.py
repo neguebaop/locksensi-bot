@@ -338,11 +338,22 @@ class PanelOptionsButton(discord.ui.Button):
         self.panel_id = int(panel_id)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_message(
-            "**Selecione um Produto**",
-            view=PanelOnlyView(self.panel_id),
-            ephemeral=True,
-        )
+        # Confirma o clique imediatamente. Carregar os produtos consulta o banco
+        # e, em hospedagens como Render, pode levar mais de 3 segundos.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            view = PanelOnlyView(self.panel_id)
+            await interaction.followup.send(
+                "**Selecione um Produto**",
+                view=view,
+                ephemeral=True,
+            )
+        except Exception as exc:
+            print(f"Erro ao abrir opções do painel {self.panel_id}: {exc}")
+            await interaction.followup.send(
+                "Não consegui carregar os produtos deste painel agora. Tente novamente em alguns segundos.",
+                ephemeral=True,
+            )
 
 
 class PanelOptionsView(discord.ui.LayoutView):
