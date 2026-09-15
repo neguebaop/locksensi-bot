@@ -1514,6 +1514,113 @@ async def publicar_painel(
     )
 
 
+_REPUBLICAR_PAINEIS_GUILDS: set[int] = set()
+
+
+@bot.tree.command(
+    name="republicar-paineis",
+    description="Reenvia todos os painéis salvos nos canais originais",
+)
+@app_commands.describe(
+    confirmar="Use verdadeiro somente depois de conferir a quantidade mostrada"
+)
+async def republicar_paineis(interaction: discord.Interaction, confirmar: bool = False):
+    """Migra as mensagens dos painéis para uma nova aplicação do bot sem recriar produtos."""
+    if not await protected_admin_only(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "Use este comando dentro do servidor.", ephemeral=True
+        )
+        return
+
+    guild_id = interaction.guild.id
+    con = db()
+    try:
+        paineis = con.execute(
+            "SELECT id, name, channel_id FROM panels WHERE guild_id=? ORDER BY id ASC",
+            (guild_id,),
+        ).fetchall()
+    finally:
+        con.close()
+
+    if not paineis:
+        await interaction.response.send_message(
+            "Não encontrei painéis salvos neste servidor.", ephemeral=True
+        )
+        return
+
+    if not confirmar:
+        await interaction.response.send_message(
+            "🔎 Encontrei **{} painel(is)** salvo(s). Nada foi enviado ainda. "
+            "Execute `/republicar-paineis confirmar:True` para reenviar todos "
+            "nos canais originais, sem recriar produtos.".format(len(paineis)),
+            ephemeral=True,
+        )
+        return
+
+    if guild_id in _REPUBLICAR_PAINEIS_GUILDS:
+        await interaction.response.send_message(
+            "Já existe uma republicação em andamento neste servidor.", ephemeral=True
+        )
+        return
+
+    _REPUBLICAR_PAINEIS_GUILDS.add(guild_id)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    enviados: list[str] = []
+    falhas: list[str] = []
+    try:
+        for painel in paineis:
+            painel_id = int(painel["id"])
+            canal_id = painel["channel_id"]
+            nome = str(painel["name"] or f"Painel {painel_id}")[:80]
+
+            if not canal_id:
+                falhas.append(f"`{painel_id}` {nome} — sem canal salvo")
+                continue
+
+            canal = interaction.guild.get_channel(int(canal_id))
+            if canal is None:
+                try:
+                    canal = await bot.fetch_channel(int(canal_id))
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    canal = None
+
+            if not canal or not hasattr(canal, "send"):
+                falhas.append(f"`{painel_id}` {nome} — canal não encontrado/sem acesso")
+                continue
+
+            try:
+                mensagem = await canal.send(**panel_send_kwargs(painel_id))
+                con = db()
+                try:
+                    con.execute(
+                        "UPDATE panels SET channel_id=?, message_id=? WHERE id=?",
+                        (int(canal.id), int(mensagem.id), painel_id),
+                    )
+                    con.commit()
+                finally:
+                    con.close()
+                enviados.append(f"`{painel_id}` {nome}")
+                # Evita disparar o limite de mensagens ao migrar muitos painéis.
+                await asyncio.sleep(1.2)
+            except Exception as exc:
+                print(f"Erro ao republicar painel {painel_id}: {exc}")
+                falhas.append(f"`{painel_id}` {nome} — falha ao enviar")
+    finally:
+        _REPUBLICAR_PAINEIS_GUILDS.discard(guild_id)
+
+    linhas = [f"✅ **Republicação concluída:** {len(enviados)} enviado(s)."]
+    if falhas:
+        linhas.append(f"⚠️ **{len(falhas)} pendente(s):**")
+        linhas.extend(falhas[:20])
+        if len(falhas) > 20:
+            linhas.append(f"… e mais {len(falhas) - 20}.")
+    else:
+        linhas.append("Todos foram reenviados nos canais salvos.")
+    await interaction.followup.send("\n".join(linhas)[:1900], ephemeral=True)
+
+
 @bot.tree.command(
     name="painel-modo",
     description="Escolhe se o painel mostra botão Opções ou a lista direta",
