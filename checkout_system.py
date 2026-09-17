@@ -127,6 +127,15 @@ def ensure_license_schema():
             """
         )
         con._conn.execute(
+            "ALTER TABLE generated_keys ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMP NULL"
+        )
+        con._conn.execute(
+            "ALTER TABLE generated_keys ADD COLUMN IF NOT EXISTS revoked_by BIGINT NULL"
+        )
+        con._conn.execute(
+            "ALTER TABLE generated_keys ADD COLUMN IF NOT EXISTS revoked_reason TEXT NULL"
+        )
+        con._conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_generated_keys_guild_user
             ON generated_keys(guild_id,user_id,created_at DESC)
@@ -347,6 +356,49 @@ def get_generated_key(license_key, guild_id=None):
         ).fetchone()
     con.close()
     return row
+
+
+def revoke_generated_key(license_key, guild_id, revoked_by, reason=None):
+    """Revoga uma key específica deste servidor."""
+    key = normalize_license_key(license_key)
+    if not key:
+        return None
+    con = db()
+    try:
+        row = con.execute(
+            "SELECT * FROM generated_keys WHERE license_key=? AND guild_id=?",
+            (key, int(guild_id)),
+        ).fetchone()
+        if not row:
+            return None
+        con.execute(
+            "UPDATE generated_keys SET status='revoked', revoked_at=?, revoked_by=?, revoked_reason=?, updated_at=? WHERE id=?",
+            (now_iso(), int(revoked_by), (str(reason).strip()[:500] if reason else None), now_iso(), int(row["id"])),
+        )
+        con.commit()
+        return con.execute("SELECT * FROM generated_keys WHERE id=?", (int(row["id"]),)).fetchone()
+    finally:
+        con.close()
+
+
+def revoke_generated_keys_for_user(guild_id, user_id, revoked_by, reason=None):
+    """Revoga todas as keys ativas pertencentes a um usuário no servidor."""
+    con = db()
+    try:
+        rows = con.execute(
+            "SELECT * FROM generated_keys WHERE guild_id=? AND user_id=? AND LOWER(COALESCE(status,'active'))='active'",
+            (int(guild_id), int(user_id)),
+        ).fetchall()
+        if not rows:
+            return []
+        con.execute(
+            "UPDATE generated_keys SET status='revoked', revoked_at=?, revoked_by=?, revoked_reason=?, updated_at=? WHERE guild_id=? AND user_id=? AND LOWER(COALESCE(status,'active'))='active'",
+            (now_iso(), int(revoked_by), (str(reason).strip()[:500] if reason else None), now_iso(), int(guild_id), int(user_id)),
+        )
+        con.commit()
+        return rows
+    finally:
+        con.close()
 
 
 def _build_expiry_hours(duration_hours):
@@ -3981,6 +4033,48 @@ class LockSensiKeysCommands(app_commands.Group):
                 await usuario.send(embed=dm_embed)
             except Exception:
                 pass
+
+    @app_commands.command(
+        name="revogar-key",
+        description="Revoga uma key e bloqueia o acesso ao painel",
+    )
+    @app_commands.describe(key="A key completa que será bloqueada", motivo="Motivo interno opcional")
+    async def revoke_key(self, i: discord.Interaction, key: str, motivo: Optional[str] = None):
+        if not i.guild:
+            await i.response.send_message("Use este comando dentro do servidor.", ephemeral=True)
+            return
+        if int(i.user.id) != LOCKSENSI_OWNER_ID:
+            await i.response.send_message("Apenas o dono da Lock Sensi pode revogar keys.", ephemeral=True)
+            return
+        row = revoke_generated_key(key, i.guild.id, i.user.id, motivo)
+        if not row:
+            await i.response.send_message("Não encontrei essa key neste servidor.", ephemeral=True)
+            return
+        await i.response.send_message(
+            f"Key revogada. Cliente: <@{int(row['user_id'])}> | Produto ID: {int(row['product_id'])} | Motivo: {motivo or 'Não informado'}",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="revogar-usuario",
+        description="Revoga todas as keys ativas de uma pessoa",
+    )
+    @app_commands.describe(usuario="Pessoa que perderá todas as keys ativas", motivo="Motivo interno opcional")
+    async def revoke_user_keys(self, i: discord.Interaction, usuario: discord.Member, motivo: Optional[str] = None):
+        if not i.guild:
+            await i.response.send_message("Use este comando dentro do servidor.", ephemeral=True)
+            return
+        if int(i.user.id) != LOCKSENSI_OWNER_ID:
+            await i.response.send_message("Apenas o dono da Lock Sensi pode revogar keys.", ephemeral=True)
+            return
+        rows = revoke_generated_keys_for_user(i.guild.id, usuario.id, i.user.id, motivo)
+        if not rows:
+            await i.response.send_message(f"{usuario.mention} não possui keys ativas neste servidor.", ephemeral=True)
+            return
+        await i.response.send_message(
+            f"{len(rows)} key(s) revogada(s) de {usuario.mention}. Motivo: {motivo or 'Não informado'}",
+            ephemeral=True,
+        )
 
     @app_commands.command(
         name="key-produto",
