@@ -23,6 +23,7 @@ TERMS_URL = os.getenv("TERMS_URL", STORE_URL).strip()
 BOT = None
 ADMIN_CHECK = None
 LICENSE_ORDER_LOCKS = {}
+HWID_RESET_LOCKS = {}
 
 # Permissão especial para geração MANUAL de keys.
 # A geração automática após pagamento continua funcionando para clientes.
@@ -105,6 +106,10 @@ def ensure_license_schema():
         con._conn.execute(
             "ALTER TABLE products ADD COLUMN IF NOT EXISTS license_app_code TEXT"
         )
+        # Produto de serviço: depois do pagamento libera UM reset de HWID.
+        con._conn.execute(
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS is_hwid_reset INTEGER DEFAULT 0"
+        )
 
         # Uma compra aprovada pode gerar no máximo uma key.
         con._conn.execute(
@@ -125,15 +130,6 @@ def ensure_license_schema():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
-        )
-        con._conn.execute(
-            "ALTER TABLE generated_keys ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMP NULL"
-        )
-        con._conn.execute(
-            "ALTER TABLE generated_keys ADD COLUMN IF NOT EXISTS revoked_by BIGINT NULL"
-        )
-        con._conn.execute(
-            "ALTER TABLE generated_keys ADD COLUMN IF NOT EXISTS revoked_reason TEXT NULL"
         )
         con._conn.execute(
             """
@@ -157,6 +153,28 @@ def ensure_license_schema():
                 last_attempt TIMESTAMPTZ NOT NULL DEFAULT now(),
                 PRIMARY KEY(hwid_hash,app_code)
             )
+            """
+        )
+        con._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hwid_reset_requests(
+                id BIGSERIAL PRIMARY KEY,
+                order_id BIGINT NOT NULL UNIQUE,
+                guild_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                product_id BIGINT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                license_key TEXT NULL,
+                completed_at TIMESTAMP NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        con._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_hwid_reset_requests_pending
+            ON hwid_reset_requests(guild_id,user_id,status,created_at DESC)
             """
         )
         con._conn.execute("ALTER TABLE generated_keys ENABLE ROW LEVEL SECURITY")
@@ -358,45 +376,40 @@ def get_generated_key(license_key, guild_id=None):
     return row
 
 
-def revoke_generated_key(license_key, guild_id, revoked_by, reason=None):
-    """Revoga uma key específica deste servidor."""
-    key = normalize_license_key(license_key)
-    if not key:
-        return None
+def is_hwid_reset_product(product):
+    return int(_row_value(product, "is_hwid_reset", 0) or 0) == 1
+
+
+def get_hwid_reset_request(request_id):
     con = db()
     try:
-        row = con.execute(
-            "SELECT * FROM generated_keys WHERE license_key=? AND guild_id=?",
-            (key, int(guild_id)),
+        return con.execute(
+            "SELECT * FROM hwid_reset_requests WHERE id=?", (int(request_id),)
         ).fetchone()
-        if not row:
-            return None
-        con.execute(
-            "UPDATE generated_keys SET status='revoked', revoked_at=?, revoked_by=?, revoked_reason=?, updated_at=? WHERE id=?",
-            (now_iso(), int(revoked_by), (str(reason).strip()[:500] if reason else None), now_iso(), int(row["id"])),
-        )
-        con.commit()
-        return con.execute("SELECT * FROM generated_keys WHERE id=?", (int(row["id"]),)).fetchone()
     finally:
         con.close()
 
 
-def revoke_generated_keys_for_user(guild_id, user_id, revoked_by, reason=None):
-    """Revoga todas as keys ativas pertencentes a um usuário no servidor."""
+def get_or_create_hwid_reset_request(order):
+    """Cada pagamento de reset cria um crédito de uso único."""
     con = db()
     try:
-        rows = con.execute(
-            "SELECT * FROM generated_keys WHERE guild_id=? AND user_id=? AND LOWER(COALESCE(status,'active'))='active'",
-            (int(guild_id), int(user_id)),
-        ).fetchall()
-        if not rows:
-            return []
         con.execute(
-            "UPDATE generated_keys SET status='revoked', revoked_at=?, revoked_by=?, revoked_reason=?, updated_at=? WHERE guild_id=? AND user_id=? AND LOWER(COALESCE(status,'active'))='active'",
-            (now_iso(), int(revoked_by), (str(reason).strip()[:500] if reason else None), now_iso(), int(guild_id), int(user_id)),
+            """
+            INSERT INTO hwid_reset_requests(
+                order_id,guild_id,user_id,product_id,status,created_at,updated_at
+            ) VALUES(?,?,?,?, 'pending', ?, ?)
+            ON CONFLICT(order_id) DO NOTHING
+            """,
+            (
+                int(order["id"]), int(order["guild_id"]), int(order["user_id"]),
+                int(order["product_id"]), now_iso(), now_iso(),
+            ),
         )
         con.commit()
-        return rows
+        return con.execute(
+            "SELECT * FROM hwid_reset_requests WHERE order_id=?", (int(order["id"]),)
+        ).fetchone()
     finally:
         con.close()
 
@@ -3426,6 +3439,175 @@ class LicenseGenerateView(discord.ui.View):
             pass
 
 
+def build_hwid_reset_embed(product_name, request_id):
+    return discord.Embed(
+        title="🌀 Reset de HWID • Pronto para usar",
+        description=(
+            f"Seu pagamento de **{product_name}** foi aprovado.\n\n"
+            "Clique em **Informar minha Key**, cole a key do seu painel e o bot "
+            "vai desvincular o PC/HWID automaticamente.\n\n"
+            "🔒 Por segurança, só aceitamos uma key que pertença à sua própria conta.\n"
+            f"🧾 Reset: `#{request_id}`"
+        ),
+        color=0x5865F2,
+    )
+
+
+class HwidResetKeyModal(discord.ui.Modal, title="Resetar HWID"):
+    def __init__(self, request_id):
+        super().__init__(timeout=600)
+        self.request_id = int(request_id)
+        self.key = discord.ui.TextInput(
+            label="Cole sua Key Lock Sensi",
+            placeholder="Ex.: LOCK-ABCDE-FGHIJ-KLMNP",
+            min_length=6,
+            max_length=120,
+        )
+        self.add_item(self.key)
+
+    async def on_submit(self, i):
+        request = get_hwid_reset_request(self.request_id)
+        if not request or int(request["user_id"]) != int(i.user.id):
+            await i.response.send_message(
+                "❌ Este reset não pertence à sua conta.", ephemeral=True
+            )
+            return
+
+        if str(request["status"]) == "completed":
+            await i.response.send_message(
+                "✅ Este reset já foi usado.", ephemeral=True
+            )
+            return
+
+        key = normalize_license_key(str(self.key))
+        lock = HWID_RESET_LOCKS.setdefault(self.request_id, asyncio.Lock())
+        async with lock:
+            con = db()
+            try:
+                claimed = con.execute(
+                    """
+                    UPDATE hwid_reset_requests
+                    SET status='processing',updated_at=?
+                    WHERE id=? AND user_id=? AND status='pending'
+                    RETURNING *
+                    """,
+                    (now_iso(), self.request_id, int(i.user.id)),
+                ).fetchone()
+                if not claimed:
+                    con.rollback()
+                    current = con.execute(
+                        "SELECT status FROM hwid_reset_requests WHERE id=?",
+                        (self.request_id,),
+                    ).fetchone()
+                    if current and str(current["status"]) == "completed":
+                        msg = "✅ Este reset já foi usado."
+                    else:
+                        msg = "⚠️ Esse reset já está sendo processado. Tente novamente em alguns segundos."
+                    await i.response.send_message(msg, ephemeral=True)
+                    return
+
+                row = con.execute(
+                    """
+                    SELECT * FROM generated_keys
+                    WHERE license_key=? AND guild_id=? AND user_id=?
+                    FOR UPDATE
+                    """,
+                    (key, int(claimed["guild_id"]), int(i.user.id)),
+                ).fetchone()
+                if not row:
+                    con.execute(
+                        "UPDATE hwid_reset_requests SET status='pending',updated_at=? WHERE id=?",
+                        (now_iso(), self.request_id),
+                    )
+                    con.commit()
+                    await i.response.send_message(
+                        "❌ Não encontrei essa key na sua conta. Confira e envie a key correta.",
+                        ephemeral=True,
+                    )
+                    return
+
+                con.execute(
+                    """
+                    UPDATE generated_keys
+                    SET hwid=NULL,hwid_bound_at=NULL,updated_at=?
+                    WHERE id=?
+                    """,
+                    (now_iso(), int(row["id"])),
+                )
+                con.execute(
+                    """
+                    UPDATE hwid_reset_requests
+                    SET status='completed',license_key=?,completed_at=?,updated_at=?
+                    WHERE id=?
+                    """,
+                    (key, now_iso(), now_iso(), self.request_id),
+                )
+                con.commit()
+            except Exception as exc:
+                con.rollback()
+                print(f"[HWID RESET] falha request={self.request_id}: {exc}", flush=True)
+                await i.response.send_message(
+                    "❌ Não consegui concluir o reset agora. Tente novamente em instantes.",
+                    ephemeral=True,
+                )
+                return
+            finally:
+                con.close()
+
+        HWID_RESET_LOCKS.pop(self.request_id, None)
+        await i.response.send_message(
+            "✅ **HWID resetado com sucesso!**\n"
+            "Agora abra seu painel no novo PC e entre com a mesma key.",
+            ephemeral=True,
+        )
+
+
+class HwidResetActionView(discord.ui.View):
+    def __init__(self, request_id):
+        super().__init__(timeout=None)
+        self.request_id = int(request_id)
+        button = discord.ui.Button(
+            label="🔑 Informar minha Key",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"locksensi:hwid-reset:request:{self.request_id}",
+        )
+        button.callback = self.open_modal
+        self.add_item(button)
+
+    async def open_modal(self, i):
+        request = get_hwid_reset_request(self.request_id)
+        if not request or int(request["user_id"]) != int(i.user.id):
+            await i.response.send_message(
+                "❌ Este reset não pertence à sua conta.", ephemeral=True
+            )
+            return
+        if str(request["status"]) == "completed":
+            await i.response.send_message("✅ Este reset já foi usado.", ephemeral=True)
+            return
+        await i.response.send_modal(HwidResetKeyModal(self.request_id))
+
+
+class HwidResetBuyView(discord.ui.View):
+    def __init__(self, product_id):
+        super().__init__(timeout=None)
+        self.product_id = int(product_id)
+        button = discord.ui.Button(
+            label="🌀 Adquirir Reset HWID",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"locksensi:hwid-reset:buy:{self.product_id}",
+        )
+        button.callback = self.buy
+        self.add_item(button)
+
+    async def buy(self, i):
+        await i.response.defer(ephemeral=True, thinking=True)
+        product = get_product(self.product_id)
+        if not product or not is_hwid_reset_product(product):
+            await i.followup.send("❌ Este produto de reset não está disponível.", ephemeral=True)
+            return
+        await open_cart(i, self.product_id)
+
+
 class SaleView(discord.ui.View):
     def __init__(self, guild_id):
         super().__init__(timeout=None)
@@ -3487,12 +3669,23 @@ async def deliver(oid):
         role_result = await grant_purchase_role(guild, member, p)
 
     benefits = get_product_benefits(p)
+    is_reset_purchase = is_hwid_reset_product(p)
+    reset_request = get_or_create_hwid_reset_request(o) if is_reset_purchase else None
 
     # A key não é criada aqui.
     # O cliente cria a própria key pelo painel "Criar sua Key" depois
     # que esta compra já estiver aprovada.
     sent = False
-    if dm_user:
+    if dm_user and is_reset_purchase and reset_request:
+        try:
+            await dm_user.send(
+                embed=build_hwid_reset_embed(o["product_name"], int(reset_request["id"])),
+                view=HwidResetActionView(int(reset_request["id"])),
+            )
+            sent = True
+        except Exception:
+            pass
+    elif dm_user:
         e = discord.Embed(
             title="✅ Compra aprovada e entregue",
             description=f"Produto: **{o['product_name']}**\nPedido: `#{oid}`",
@@ -3624,6 +3817,15 @@ async def deliver(oid):
         cc = guild.get_channel(o["cart_channel_id"])
         if cc:
             try:
+                if is_reset_purchase and reset_request:
+                    await cc.send(
+                        "✅ Pagamento aprovado. Informe sua key abaixo para concluir o reset.",
+                        embed=build_hwid_reset_embed(
+                            o["product_name"], int(reset_request["id"])
+                        ),
+                        view=HwidResetActionView(int(reset_request["id"])),
+                    )
+                    return
                 await cc.send(
                     "✅ Pagamento aprovado. A entrega foi enviada no seu privado. Este carrinho fechará em 20 segundos."
                 )
@@ -3921,6 +4123,16 @@ def create_manual_license(product, guild_id, user_id, duration_hours=None):
     raise RuntimeError("Não consegui criar uma key manual única.")
 
 
+async def require_locksensi_owner(interaction):
+    """Ações sensíveis de HWID ficam restritas ao dono real do bot."""
+    if int(getattr(interaction.user, "id", 0)) == LOCKSENSI_OWNER_ID:
+        return True
+    await interaction.response.send_message(
+        "❌ Esta opção é exclusiva do dono da Lock Sensi.", ephemeral=True
+    )
+    return False
+
+
 class LockSensiKeysCommands(app_commands.Group):
     def __init__(self):
         super().__init__(
@@ -4033,48 +4245,6 @@ class LockSensiKeysCommands(app_commands.Group):
                 await usuario.send(embed=dm_embed)
             except Exception:
                 pass
-
-    @app_commands.command(
-        name="revogar-key",
-        description="Revoga uma key e bloqueia o acesso ao painel",
-    )
-    @app_commands.describe(key="A key completa que será bloqueada", motivo="Motivo interno opcional")
-    async def revoke_key(self, i: discord.Interaction, key: str, motivo: Optional[str] = None):
-        if not i.guild:
-            await i.response.send_message("Use este comando dentro do servidor.", ephemeral=True)
-            return
-        if int(i.user.id) != LOCKSENSI_OWNER_ID:
-            await i.response.send_message("Apenas o dono da Lock Sensi pode revogar keys.", ephemeral=True)
-            return
-        row = revoke_generated_key(key, i.guild.id, i.user.id, motivo)
-        if not row:
-            await i.response.send_message("Não encontrei essa key neste servidor.", ephemeral=True)
-            return
-        await i.response.send_message(
-            f"Key revogada. Cliente: <@{int(row['user_id'])}> | Produto ID: {int(row['product_id'])} | Motivo: {motivo or 'Não informado'}",
-            ephemeral=True,
-        )
-
-    @app_commands.command(
-        name="revogar-usuario",
-        description="Revoga todas as keys ativas de uma pessoa",
-    )
-    @app_commands.describe(usuario="Pessoa que perderá todas as keys ativas", motivo="Motivo interno opcional")
-    async def revoke_user_keys(self, i: discord.Interaction, usuario: discord.Member, motivo: Optional[str] = None):
-        if not i.guild:
-            await i.response.send_message("Use este comando dentro do servidor.", ephemeral=True)
-            return
-        if int(i.user.id) != LOCKSENSI_OWNER_ID:
-            await i.response.send_message("Apenas o dono da Lock Sensi pode revogar keys.", ephemeral=True)
-            return
-        rows = revoke_generated_keys_for_user(i.guild.id, usuario.id, i.user.id, motivo)
-        if not rows:
-            await i.response.send_message(f"{usuario.mention} não possui keys ativas neste servidor.", ephemeral=True)
-            return
-        await i.response.send_message(
-            f"{len(rows)} key(s) revogada(s) de {usuario.mention}. Motivo: {motivo or 'Não informado'}",
-            ephemeral=True,
-        )
 
     @app_commands.command(
         name="key-produto",
@@ -4674,15 +4844,117 @@ class LockSensiKeysCommands(app_commands.Group):
         )
 
     @app_commands.command(
+        name="reset-hwid-produto",
+        description="Marca um produto pago como Reset de HWID automático",
+    )
+    @app_commands.describe(produto_id="ID local do produto de reset")
+    async def set_hwid_reset_product(self, i: discord.Interaction, produto_id: int):
+        if not await require_locksensi_owner(i):
+            return
+        product, _state = resolve_product_for_guild(produto_id, i.guild.id, repair=False)
+        if not product:
+            await i.response.send_message(
+                f"❌ Produto `#{produto_id}` não encontrado. Use `/loja produtos`.",
+                ephemeral=True,
+            )
+            return
+        con = db()
+        try:
+            con.execute(
+                "UPDATE products SET is_hwid_reset=1 WHERE id=? AND guild_id=?",
+                (int(product["id"]), int(i.guild.id)),
+            )
+            con.commit()
+        finally:
+            con.close()
+        try:
+            BOT.add_view(HwidResetBuyView(int(product["id"])))
+        except Exception:
+            pass
+        await i.response.send_message(
+            "✅ **Produto configurado como Reset de HWID.**\n"
+            f"📦 {product['name']} (`#{produto_id}`)\n"
+            "Cada pagamento libera **1 reset**, que o cliente usa ao informar a própria key.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="painel-reset-hwid",
+        description="Publica o painel de compra do Reset de HWID",
+    )
+    @app_commands.describe(
+        canal="Canal onde o card de Reset de HWID será publicado",
+        produto_id="ID local do produto configurado como reset",
+        titulo="Título do card (opcional)",
+        descricao="Descrição do card (opcional)",
+    )
+    async def post_hwid_reset_panel(
+        self,
+        i: discord.Interaction,
+        canal: discord.TextChannel,
+        produto_id: int,
+        titulo: Optional[str] = None,
+        descricao: Optional[str] = None,
+    ):
+        if not await require_locksensi_owner(i):
+            return
+        product, _state = resolve_product_for_guild(produto_id, i.guild.id, repair=False)
+        if not product or not is_hwid_reset_product(product):
+            await i.response.send_message(
+                "❌ Primeiro marque o produto com `/keys reset-hwid-produto produto_id`.",
+                ephemeral=True,
+            )
+            return
+        title = (titulo or "Reset de HWID — Restaure seu HWID de forma automática").strip()[:256]
+        body = (descricao or (
+            "Adquira um reset de HWID e, após a compra, informe sua própria key ao bot.\n"
+            "O sistema verifica a key e desvincula o PC antigo automaticamente.\n\n"
+            "O processo é 100% automatizado, rápido e seguro."
+        )).strip()[:4000]
+        embed = discord.Embed(title=title, description=body, color=0x5865F2)
+        embed.add_field(name="💰 Valor", value=f"**{money(product['price'])}**", inline=True)
+        embed.add_field(name="📦 Serviço", value="1 reset de HWID", inline=True)
+        embed.set_footer(text="LOCK SENSI • Reset automático após pagamento")
+        await canal.send(embed=embed, view=HwidResetBuyView(int(product["id"])))
+        await i.response.send_message(
+            f"✅ Painel de reset publicado em {canal.mention}.", ephemeral=True
+        )
+
+    @app_commands.command(
+        name="reset-hwid-adm",
+        description="Reseta imediatamente o HWID de uma key (somente dono)",
+    )
+    @app_commands.describe(chave="Key que terá o PC/HWID desvinculado")
+    async def license_hwid_reset_owner(self, i: discord.Interaction, chave: str):
+        if not await require_locksensi_owner(i):
+            return
+        row = get_generated_key(chave, i.guild.id)
+        if not row:
+            await i.response.send_message("❌ Key não encontrada.", ephemeral=True)
+            return
+        con = db()
+        try:
+            con.execute(
+                "UPDATE generated_keys SET hwid=NULL,hwid_bound_at=NULL,updated_at=? WHERE id=?",
+                (now_iso(), int(row["id"])),
+            )
+            con.commit()
+        finally:
+            con.close()
+        await i.response.send_message(
+            f"✅ HWID da key `{row['license_key']}` resetado.", ephemeral=True
+        )
+
+    @app_commands.command(
         name="key-hwid-reset",
-        description="Desvincula o PC/HWID de uma key",
+        description="Desvincula o PC/HWID de uma key (somente dono)",
     )
     async def license_hwid_reset(
         self,
         i: discord.Interaction,
         chave: str,
     ):
-        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+        if not await require_locksensi_owner(i):
             return
 
         row = get_generated_key(chave, i.guild.id)
@@ -6839,6 +7111,22 @@ async def setup(bot, admin_check=None):
         bot.add_view(LicenseGenerateView())
     except Exception as exc:
         print(f"License persistent view: {exc}")
+    # Mantém os botões de compra e de uso do reset funcionando após restart.
+    try:
+        con = db()
+        reset_products = con.execute(
+            "SELECT id FROM products WHERE active=1 AND COALESCE(is_hwid_reset,0)=1"
+        ).fetchall()
+        pending_resets = con.execute(
+            "SELECT id FROM hwid_reset_requests WHERE status IN ('pending','processing')"
+        ).fetchall()
+        con.close()
+        for row in reset_products:
+            bot.add_view(HwidResetBuyView(int(row["id"])))
+        for row in pending_resets:
+            bot.add_view(HwidResetActionView(int(row["id"])))
+    except Exception as exc:
+        print(f"HWID reset persistent views: {exc}")
 
     for command_group in (
         CheckoutCommands(),
