@@ -423,11 +423,44 @@ class PanelSelect(discord.ui.Select):
         self.panel_id = panel_id
         options = []
         con = db()
-        rows = con.execute(
-            """SELECT p.* FROM products p JOIN panel_products pp ON p.id=pp.product_id WHERE pp.panel_id=? AND p.active=1 ORDER BY p.price ASC""",
-            (panel_id,),
-        ).fetchall()
-        con.close()
+        try:
+            # Mostra no menu SOMENTE os produtos principais.
+            # Produtos usados como variantes (ex.: Mensal/Permanente) continuam
+            # vinculados ao painel e ao banco, mas ficam escondidos desta lista.
+            try:
+                rows = con.execute(
+                    """
+                    SELECT p.*
+                    FROM products p
+                    JOIN panel_products pp ON p.id=pp.product_id
+                    WHERE pp.panel_id=?
+                      AND p.active=1
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM checkout_variants cv
+                          WHERE cv.variant_product_id=p.id
+                            AND cv.guild_id=p.guild_id
+                      )
+                    ORDER BY p.price ASC
+                    """,
+                    (panel_id,),
+                ).fetchall()
+            except Exception as exc:
+                # Compatibilidade com instalações antigas antes da tabela
+                # checkout_variants existir.
+                print(f"[MENU PRODUTOS] fallback sem variantes: {exc}")
+                rows = con.execute(
+                    """
+                    SELECT p.*
+                    FROM products p
+                    JOIN panel_products pp ON p.id=pp.product_id
+                    WHERE pp.panel_id=? AND p.active=1
+                    ORDER BY p.price ASC
+                    """,
+                    (panel_id,),
+                ).fetchall()
+        finally:
+            con.close()
         for p in rows[:25]:
             stock = "∞" if p["stock"] < 0 else str(p["stock"])
             options.append(
