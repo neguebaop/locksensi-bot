@@ -250,6 +250,36 @@ def money(v):
     return f"R${float(v):.2f}".replace(".", ",")
 
 
+def parse_price_input(value):
+    """Converte preço digitado em PT-BR ou padrão decimal sem confundir 19,99 com 1999."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return round(float(value), 2)
+
+    raw = str(value).strip().upper().replace("R$", "").replace(" ", "")
+    raw = re.sub(r"[^0-9,.-]", "", raw)
+    if not raw:
+        raise ValueError("Preço vazio")
+
+    if "," in raw and "." in raw:
+        # O último separador é o decimal; o outro é tratado como milhar.
+        if raw.rfind(",") > raw.rfind("."):
+            raw = raw.replace(".", "").replace(",", ".")
+        else:
+            raw = raw.replace(",", "")
+    elif "," in raw:
+        raw = raw.replace(".", "").replace(",", ".")
+    elif raw.count(".") > 1:
+        parts = raw.split(".")
+        raw = "".join(parts[:-1]) + "." + parts[-1]
+
+    price = round(float(raw), 2)
+    if price < 0:
+        raise ValueError("Preço não pode ser negativo")
+    return price
+
+
 def random_code(n=8):
     return "".join(
         random.choice(string.ascii_uppercase + string.digits) for _ in range(n)
@@ -376,16 +406,36 @@ class PanelOptionsView(discord.ui.LayoutView):
         try:
             custom = get_customization(int(panel["guild_id"]))
             store_name = custom["store_name"] or "Entregas automática"
-            color = custom["color"] or panel["color"] or 0x5865F2
+            custom_color = custom["color"] if custom else None
         except Exception:
             store_name = "Entregas automática"
-            color = panel["color"] or 0x5865F2
+            custom_color = None
+
+        # Cor individual do painel tem prioridade sobre a cor global da loja.
+        # -1 é usado como sentinela para "sem barra / transparente".
+        panel_color = panel["color"]
+        try:
+            panel_color = int(panel_color) if panel_color is not None else None
+        except Exception:
+            panel_color = None
+
+        if panel_color == -1:
+            color = None
+        elif panel_color is not None:
+            color = panel_color
+        else:
+            color = int(custom_color or 0x5865F2)
 
         title = str(panel["title"] or panel["name"] or "Produtos").strip()
         description = str(panel["description"] or "Confira as opções disponíveis.").strip()
         large_image = str(panel["banner_url"] or panel["image_url"] or "").strip()
 
-        container = discord.ui.Container(accent_color=int(color))
+        # Sem accent_color = sem a barra colorida lateral.
+        container = (
+            discord.ui.Container()
+            if color is None
+            else discord.ui.Container(accent_color=int(color))
+        )
         if valid_url(large_image):
             gallery = discord.ui.MediaGallery()
             gallery.add_item(media=large_image, description=title[:256])
@@ -416,6 +466,75 @@ def panel_send_kwargs(panel_id: int):
     if isinstance(view, discord.ui.LayoutView):
         return {"view": view}
     return {"embed": panel_embed(panel_id), "view": view}
+
+
+async def refresh_published_panel(guild: discord.Guild, panel_id: int) -> bool:
+    """Atualiza a última mensagem publicada do painel, quando ela ainda existe."""
+    if not guild:
+        return False
+
+    con = db()
+    try:
+        panel = con.execute(
+            "SELECT * FROM panels WHERE id=? AND guild_id=?",
+            (int(panel_id), int(guild.id)),
+        ).fetchone()
+    finally:
+        con.close()
+
+    if not panel or not panel["channel_id"] or not panel["message_id"]:
+        return False
+
+    try:
+        channel = guild.get_channel(int(panel["channel_id"]))
+        if channel is None:
+            channel = await guild.fetch_channel(int(panel["channel_id"]))
+        message = await channel.fetch_message(int(panel["message_id"]))
+        view = panel_view(int(panel_id))
+        if isinstance(view, discord.ui.LayoutView):
+            await message.edit(content=None, embed=None, attachments=[], view=view)
+        else:
+            await message.edit(embed=panel_embed(int(panel_id)), view=view)
+        return True
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException, AttributeError):
+        return False
+
+
+def parse_panel_color(value: str) -> tuple[int, str]:
+    """Converte nome/HEX para inteiro. -1 significa sem barra (transparente)."""
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "transparente": (-1, "transparente / sem barra"),
+        "transparent": (-1, "transparente / sem barra"),
+        "sem barra": (-1, "transparente / sem barra"),
+        "sem-barra": (-1, "transparente / sem barra"),
+        "none": (-1, "transparente / sem barra"),
+        "preto": (0x000000, "preto"),
+        "black": (0x000000, "preto"),
+        "vermelho": (0xED4245, "vermelho"),
+        "red": (0xED4245, "vermelho"),
+        "azul": (0x5865F2, "azul"),
+        "blue": (0x5865F2, "azul"),
+        "roxo": (0x8B2CF5, "roxo"),
+        "purple": (0x8B2CF5, "roxo"),
+        "verde": (0x57F287, "verde"),
+        "green": (0x57F287, "verde"),
+        "amarelo": (0xFEE75C, "amarelo"),
+        "yellow": (0xFEE75C, "amarelo"),
+        "branco": (0xFFFFFF, "branco"),
+        "white": (0xFFFFFF, "branco"),
+    }
+    if raw in aliases:
+        return aliases[raw]
+
+    clean = raw.replace("#", "").replace("0x", "")
+    if re.fullmatch(r"[0-9a-f]{6}", clean):
+        value_int = int(clean, 16)
+        return value_int, f"#{clean.upper()}"
+
+    raise ValueError(
+        "Cor inválida. Use transparente, preto, vermelho, azul, roxo, verde ou HEX como #FF0000."
+    )
 
 
 class PanelSelect(discord.ui.Select):
@@ -545,10 +664,23 @@ def panel_embed(panel_id: int):
     try:
         custom = get_customization(int(panel["guild_id"]))
         loja = custom["store_name"] or "Entregas automática"
-        cor = custom["color"] or panel["color"] or 0x5865F2
+        custom_color = custom["color"] if custom else None
     except Exception:
         loja = "Entregas automática"
-        cor = panel["color"] or 0x5865F2
+        custom_color = None
+
+    # Embeds clássicos não possuem barra "transparente"; quando o painel está
+    # com -1 usamos a cor global apenas como fallback visual.
+    panel_color = panel["color"]
+    try:
+        panel_color = int(panel_color) if panel_color is not None else None
+    except Exception:
+        panel_color = None
+    cor = (
+        panel_color
+        if panel_color is not None and panel_color >= 0
+        else int(custom_color or 0x5865F2)
+    )
     embed = discord.Embed(
         title=panel["title"] or panel["name"],
         description=(panel["description"] or "")[:4096],
@@ -817,20 +949,38 @@ class PanelTextModal(discord.ui.Modal, title="Configurar painel"):
         self.add_item(self.banner)
 
     async def on_submit(self, interaction):
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "❌ Use este painel dentro do servidor.", ephemeral=True
+            )
+            return
+
         con = db()
-        con.execute(
-            "UPDATE panels SET title=?,description=?,image_url=?,banner_url=? WHERE id=?",
-            (
-                str(self.titulo),
-                str(self.desc),
-                str(self.img),
-                str(self.banner),
-                self.panel_id,
-            ),
+        try:
+            con.execute(
+                """
+                UPDATE panels
+                SET title=?,description=?,image_url=?,banner_url=?
+                WHERE id=? AND guild_id=?
+                """,
+                (
+                    str(self.titulo),
+                    str(self.desc),
+                    str(self.img),
+                    str(self.banner),
+                    self.panel_id,
+                    interaction.guild.id,
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        atualizado = await refresh_published_panel(interaction.guild, self.panel_id)
+        extra = " A mensagem publicada também foi atualizada." if atualizado else ""
+        await interaction.response.send_message(
+            "✅ Painel atualizado." + extra, ephemeral=True
         )
-        con.commit()
-        con.close()
-        await interaction.response.send_message("✅ Painel atualizado.", ephemeral=True)
 
 
 class PlanModal(discord.ui.Modal, title="Adicionar plano/produto"):
@@ -854,7 +1004,7 @@ class PlanModal(discord.ui.Modal, title="Adicionar plano/produto"):
 
     async def on_submit(self, interaction):
         try:
-            price = float(str(self.preco).replace(",", "."))
+            price = parse_price_input(str(self.preco))
             stock = int(str(self.estoque))
         except Exception:
             await interaction.response.send_message(
@@ -1495,23 +1645,153 @@ async def criar_painel_config(interaction, nome: str):
 
 
 @bot.tree.command(
+    name="editar-painel",
+    description="Edita título, descrição e imagens de um painel existente",
+)
+@app_commands.describe(painel_id="ID do painel, ex.: 137")
+async def editar_painel(interaction: discord.Interaction, painel_id: int):
+    if not await protected_admin_only(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "❌ Use este comando dentro do servidor.", ephemeral=True
+        )
+        return
+
+    con = db()
+    try:
+        panel = con.execute(
+            "SELECT id FROM panels WHERE id=? AND guild_id=?",
+            (int(painel_id), int(interaction.guild.id)),
+        ).fetchone()
+    finally:
+        con.close()
+
+    if not panel:
+        await interaction.response.send_message(
+            f"❌ Painel `{painel_id}` não encontrado neste servidor.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_modal(PanelTextModal(int(painel_id)))
+
+
+@bot.tree.command(
+    name="reabrir-config",
+    description="Recria a mensagem com os botões de configuração de um painel",
+)
+@app_commands.describe(painel_id="ID do painel, ex.: 137")
+async def reabrir_config(interaction: discord.Interaction, painel_id: int):
+    if not await protected_admin_only(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "❌ Use este comando dentro do servidor.", ephemeral=True
+        )
+        return
+
+    con = db()
+    try:
+        panel = con.execute(
+            "SELECT * FROM panels WHERE id=? AND guild_id=?",
+            (int(painel_id), int(interaction.guild.id)),
+        ).fetchone()
+    finally:
+        con.close()
+
+    if not panel:
+        await interaction.response.send_message(
+            f"❌ Painel `{painel_id}` não encontrado neste servidor.", ephemeral=True
+        )
+        return
+
+    nome = str(panel["title"] or panel["name"] or f"Painel {painel_id}")
+    await interaction.response.send_message(
+        "✅ Configuração reaberta abaixo.", ephemeral=True
+    )
+    await interaction.channel.send(
+        f"⚙️ Configuração do painel **{nome}**\nID: `{painel_id}`",
+        view=ConfigPanelView(int(painel_id)),
+    )
+
+
+@bot.tree.command(
+    name="cor-painel",
+    description="Muda a barra lateral do painel (ou remove a barra)",
+)
+@app_commands.describe(
+    painel_id="ID do painel, ex.: 137",
+    cor="transparente, preto, vermelho, azul, roxo, verde ou HEX (#FF0000)",
+)
+async def cor_painel(
+    interaction: discord.Interaction, painel_id: int, cor: str
+):
+    if not await protected_admin_only(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "❌ Use este comando dentro do servidor.", ephemeral=True
+        )
+        return
+
+    try:
+        cor_valor, cor_nome = parse_panel_color(cor)
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
+
+    con = db()
+    try:
+        panel = con.execute(
+            "SELECT * FROM panels WHERE id=? AND guild_id=?",
+            (int(painel_id), int(interaction.guild.id)),
+        ).fetchone()
+        if not panel:
+            await interaction.response.send_message(
+                f"❌ Painel `{painel_id}` não encontrado neste servidor.", ephemeral=True
+            )
+            return
+        con.execute(
+            "UPDATE panels SET color=? WHERE id=? AND guild_id=?",
+            (int(cor_valor), int(painel_id), int(interaction.guild.id)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    atualizado = await refresh_published_panel(interaction.guild, int(painel_id))
+    extra = " O painel publicado também foi atualizado." if atualizado else ""
+    await interaction.response.send_message(
+        f"✅ Barra do painel `{painel_id}` alterada para **{cor_nome}**.{extra}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
     name="adicionar-plano", description="Adiciona plano/produto a um painel existente"
 )
 async def adicionar_plano(
     interaction,
     painel_id: int,
     nome: str,
-    preco: float,
+    preco: str,
     estoque: int = -1,
     descricao: str = "",
 ):
     if not await protected_admin_only(interaction):
         return
+    try:
+        preco_final = parse_price_input(preco)
+    except Exception:
+        await interaction.response.send_message(
+            "❌ Preço inválido. Use `19,99` ou `19.99`.", ephemeral=True
+        )
+        return
     con = db()
     cur = con.cursor()
     cur.execute(
         "INSERT INTO products(guild_id,name,price,stock,description,category,delivery_text) VALUES(?,?,?,?,?,?,?)",
-        (interaction.guild.id, nome, preco, estoque, descricao, "Painel", descricao),
+        (interaction.guild.id, nome, preco_final, estoque, descricao, "Painel", descricao),
     )
     pid = cur.lastrowid
     cur.execute(
@@ -1806,13 +2086,20 @@ async def ranking(
 async def criar_produto_canal_atual(
     interaction,
     nome: str,
-    preco: float,
+    preco: str,
     estoque: int,
     descricao: str,
     imagem: Optional[str] = None,
     banner: Optional[str] = None,
 ):
     if not await protected_admin_only(interaction):
+        return
+    try:
+        preco_final = parse_price_input(preco)
+    except Exception:
+        await interaction.response.send_message(
+            "❌ Preço inválido. Use `19,99` ou `19.99`.", ephemeral=True
+        )
         return
     con = db()
     cur = con.cursor()
@@ -1821,7 +2108,7 @@ async def criar_produto_canal_atual(
         (
             interaction.guild.id,
             nome,
-            preco,
+            preco_final,
             estoque,
             descricao,
             imagem or "",
@@ -1852,13 +2139,20 @@ async def criar_produto_lista(
     interaction,
     painel_id: int,
     nome: str,
-    preco: float,
+    preco: str,
     estoque: int = -1,
     descricao: str = "",
     imagem: Optional[str] = None,
     banner: Optional[str] = None,
 ):
     if not await protected_admin_only(interaction):
+        return
+    try:
+        preco_final = parse_price_input(preco)
+    except Exception:
+        await interaction.response.send_message(
+            "❌ Preço inválido. Use `19,99` ou `19.99`.", ephemeral=True
+        )
         return
     con = db()
     cur = con.cursor()
@@ -1867,7 +2161,7 @@ async def criar_produto_lista(
         (
             interaction.guild.id,
             nome,
-            preco,
+            preco_final,
             estoque,
             descricao,
             imagem or "",
@@ -1886,19 +2180,112 @@ async def criar_produto_lista(
     )
 
 
+
+class AjustarPrecoModal(discord.ui.Modal, title="Ajustar preço do produto"):
+    def __init__(self, produto_local_id: int, guild_id: int):
+        super().__init__()
+        self.produto_local_id = int(produto_local_id)
+        self.guild_id = int(guild_id)
+        self.preco = discord.ui.TextInput(
+            label="Novo preço",
+            placeholder="Ex.: 19,99",
+            required=True,
+            max_length=20,
+        )
+        self.add_item(self.preco)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            novo_preco = parse_price_input(str(self.preco))
+        except Exception:
+            await interaction.response.send_message(
+                "❌ Preço inválido. Digite como `19,99` ou `19.99`.",
+                ephemeral=True,
+            )
+            return
+
+        con = db()
+        try:
+            produto = con.execute(
+                "SELECT * FROM products WHERE guild_id=? AND local_id=?",
+                (self.guild_id, self.produto_local_id),
+            ).fetchone()
+            if not produto:
+                await interaction.response.send_message(
+                    f"❌ Produto `#{self.produto_local_id}` não encontrado neste servidor.",
+                    ephemeral=True,
+                )
+                return
+            con.execute(
+                "UPDATE products SET price=? WHERE id=? AND guild_id=?",
+                (novo_preco, int(produto["id"]), self.guild_id),
+            )
+            con.commit()
+            nome = str(produto["name"])
+        finally:
+            con.close()
+
+        await interaction.response.send_message(
+            f"✅ Preço de **{nome}** (`#{self.produto_local_id}`) alterado para **{money(novo_preco)}**.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="ajustar-preco",
+    description="Altera o preço pelo ID visível usando um campo de texto seguro",
+)
+@app_commands.describe(produto_id="ID visível mostrado em /loja produtos, ex.: 131")
+async def ajustar_preco(interaction: discord.Interaction, produto_id: int):
+    if not await protected_admin_only(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "❌ Use este comando dentro do servidor.", ephemeral=True
+        )
+        return
+
+    con = db()
+    try:
+        produto = con.execute(
+            "SELECT id,name FROM products WHERE guild_id=? AND local_id=?",
+            (interaction.guild.id, int(produto_id)),
+        ).fetchone()
+    finally:
+        con.close()
+
+    if not produto:
+        await interaction.response.send_message(
+            f"❌ Produto `#{produto_id}` não encontrado neste servidor.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_modal(
+        AjustarPrecoModal(produto_id, interaction.guild.id)
+    )
+
+
 @bot.tree.command(name="editar-produto", description="Edita produto pelo ID visível da loja")
 @app_commands.describe(produto_id="ID visível mostrado em /loja produtos (ex.: 122)")
 async def editar_produto(
     interaction,
     produto_id: int,
     nome: Optional[str] = None,
-    preco: Optional[float] = None,
+    preco: Optional[str] = None,
     estoque: Optional[int] = None,
     descricao: Optional[str] = None,
     imagem: Optional[str] = None,
     banner: Optional[str] = None,
 ):
     if not await protected_admin_only(interaction):
+        return
+    try:
+        preco_final = parse_price_input(preco) if preco is not None else None
+    except Exception:
+        await interaction.response.send_message(
+            "❌ Preço inválido. Use `19,99` ou `19.99`.", ephemeral=True
+        )
         return
     con = db()
     try:
@@ -1930,7 +2317,7 @@ async def editar_produto(
             """,
             (
                 nome or p["name"],
-                preco if preco is not None else p["price"],
+                preco_final if preco_final is not None else p["price"],
                 estoque if estoque is not None else p["stock"],
                 descricao if descricao is not None else p["description"],
                 imagem if imagem is not None else p["image_url"],
