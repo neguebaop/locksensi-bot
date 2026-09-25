@@ -1886,7 +1886,8 @@ async def criar_produto_lista(
     )
 
 
-@bot.tree.command(name="editar-produto", description="Edita produto")
+@bot.tree.command(name="editar-produto", description="Edita produto pelo ID visível da loja")
+@app_commands.describe(produto_id="ID visível mostrado em /loja produtos (ex.: 122)")
 async def editar_produto(
     interaction,
     produto_id: int,
@@ -1900,40 +1901,98 @@ async def editar_produto(
     if not await protected_admin_only(interaction):
         return
     con = db()
-    p = con.execute("SELECT * FROM products WHERE id=?", (produto_id,)).fetchone()
-    if not p:
-        con.close()
-        await interaction.response.send_message(
-            "❌ Produto não encontrado.", ephemeral=True
+    try:
+        # O número exibido ao administrador é products.local_id, que é separado
+        # para cada servidor. Primeiro resolvemos por ele. O fallback em products.id
+        # mantém compatibilidade com instalações antigas.
+        p = con.execute(
+            "SELECT * FROM products WHERE guild_id=? AND local_id=?",
+            (interaction.guild.id, int(produto_id)),
+        ).fetchone()
+        if not p:
+            p = con.execute(
+                "SELECT * FROM products WHERE guild_id=? AND id=?",
+                (interaction.guild.id, int(produto_id)),
+            ).fetchone()
+        if not p:
+            await interaction.response.send_message(
+                f"❌ Produto `#{produto_id}` não encontrado neste servidor.",
+                ephemeral=True,
+            )
+            return
+
+        global_id = int(p["id"])
+        con.execute(
+            """
+            UPDATE products
+            SET name=?,price=?,stock=?,description=?,image_url=?,banner_url=?
+            WHERE id=? AND guild_id=?
+            """,
+            (
+                nome or p["name"],
+                preco if preco is not None else p["price"],
+                estoque if estoque is not None else p["stock"],
+                descricao if descricao is not None else p["description"],
+                imagem if imagem is not None else p["image_url"],
+                banner if banner is not None else p["banner_url"],
+                global_id,
+                interaction.guild.id,
+            ),
         )
-        return
-    con.execute(
-        "UPDATE products SET name=?,price=?,stock=?,description=?,image_url=?,banner_url=? WHERE id=?",
-        (
-            nome or p["name"],
-            preco if preco is not None else p["price"],
-            estoque if estoque is not None else p["stock"],
-            descricao if descricao is not None else p["description"],
-            imagem if imagem is not None else p["image_url"],
-            banner if banner is not None else p["banner_url"],
-            produto_id,
-        ),
+        con.commit()
+        nome_final = nome or p["name"]
+    finally:
+        con.close()
+
+    await interaction.response.send_message(
+        f"✅ Produto **{nome_final}** (`#{produto_id}`) editado.", ephemeral=True
     )
-    con.commit()
-    con.close()
-    await interaction.response.send_message("✅ Produto editado.", ephemeral=True)
 
 
-@bot.tree.command(name="remover-produto", description="Desativa produto")
+@bot.tree.command(name="remover-produto", description="Desativa produto pelo ID visível da loja")
+@app_commands.describe(produto_id="ID visível mostrado em /loja produtos (ex.: 122)")
 async def remover_produto(interaction, produto_id: int):
     if not await protected_admin_only(interaction):
         return
+
     con = db()
-    con.execute("UPDATE products SET active=0 WHERE id=?", (produto_id,))
-    con.commit()
-    con.close()
+    try:
+        # IMPORTANTE: /loja produtos exibe local_id, não o products.id global.
+        # Isso evita o bug em que o comando dizia que removeu, mas o produto
+        # continuava aparecendo em Opções.
+        p = con.execute(
+            "SELECT * FROM products WHERE guild_id=? AND local_id=?",
+            (interaction.guild.id, int(produto_id)),
+        ).fetchone()
+        if not p:
+            # Compatibilidade com produtos/instalações antigas.
+            p = con.execute(
+                "SELECT * FROM products WHERE guild_id=? AND id=?",
+                (interaction.guild.id, int(produto_id)),
+            ).fetchone()
+
+        if not p:
+            await interaction.response.send_message(
+                f"❌ Produto `#{produto_id}` não encontrado neste servidor.",
+                ephemeral=True,
+            )
+            return
+
+        global_id = int(p["id"])
+        visible_id = p["local_id"] if p["local_id"] is not None else produto_id
+        nome_produto = str(p["name"] or f"Produto #{visible_id}")
+
+        con.execute(
+            "UPDATE products SET active=0 WHERE id=? AND guild_id=?",
+            (global_id, interaction.guild.id),
+        )
+        con.commit()
+    finally:
+        con.close()
+
     await interaction.response.send_message(
-        "✅ Produto removido/desativado.", ephemeral=True
+        f"✅ Produto **{nome_produto}** (`#{visible_id}`) desativado e removido de **Opções**.",
+        ephemeral=True,
     )
 
 
