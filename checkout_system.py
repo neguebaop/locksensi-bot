@@ -2371,7 +2371,7 @@ async def open_cart(interaction, product_id):
 
     if grouped_checkout and len(variants) < 2:
         await interaction.followup.send(
-            "❌ O checkout deste produto está incompleto. Configure Mensal e Permanente com `/loja checkout-variantes`.",
+            "❌ O checkout deste produto está incompleto. Configure Mensal e Permanente com `/checkout variantes`.",
             ephemeral=True,
         )
         return
@@ -6703,103 +6703,6 @@ class CheckoutCommands(app_commands.Group):
         await i.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(
-        name="checkout-variantes",
-        description="Coloca Mensal e Permanente dentro de um único carrinho",
-    )
-    @app_commands.describe(
-        produto_base="ID local que aparece no painel (ex: LOCK SENSI PRO)",
-        mensal="ID local do produto Mensal",
-        permanente="ID local do produto Permanente",
-    )
-    async def checkout_variants_configure(
-        self,
-        i: discord.Interaction,
-        produto_base: int,
-        mensal: int,
-        permanente: int,
-    ):
-        if ADMIN_CHECK and not await ADMIN_CHECK(i):
-            return
-
-        parent, _ = resolve_product_for_guild(produto_base, i.guild.id, repair=False)
-        monthly, _ = resolve_product_for_guild(mensal, i.guild.id, repair=False)
-        lifetime, _ = resolve_product_for_guild(permanente, i.guild.id, repair=False)
-        if not parent or not monthly or not lifetime:
-            await i.response.send_message(
-                "❌ Um dos IDs não existe neste servidor. Use `/loja produtos`.",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            configure_checkout_variants(
-                i.guild.id,
-                int(parent["id"]),
-                int(monthly["id"]),
-                int(lifetime["id"]),
-            )
-        except Exception as exc:
-            await i.response.send_message(f"❌ {str(exc)[:700]}", ephemeral=True)
-            return
-
-        await i.response.send_message(
-            "✅ **Checkout agrupado configurado!**\n\n"
-            f"🛒 Produto exibido: **{parent['name']}** (`#{produto_base}`)\n"
-            f"📅 Mensal: **{monthly['name']}** (`#{mensal}`) • **{money(monthly['price'])}**\n"
-            f"♾️ Permanente: **{lifetime['name']}** (`#{permanente}`) • **{money(lifetime['price'])}**\n\n"
-            "Agora, ao abrir o produto-base, o bot cria **um único canal** e o cliente "
-            "escolhe Mensal/Permanente dentro dele. Se você mudar o preço dos produtos "
-            "Mensal/Permanente depois, o carrinho usa o valor novo automaticamente.",
-            ephemeral=True,
-        )
-
-    @app_commands.command(
-        name="checkout-variantes-status",
-        description="Mostra Mensal/Permanente ligados a um produto-base",
-    )
-    async def checkout_variants_status(self, i: discord.Interaction, produto_base: int):
-        if ADMIN_CHECK and not await ADMIN_CHECK(i):
-            return
-        parent, _ = resolve_product_for_guild(produto_base, i.guild.id, repair=False)
-        if not parent:
-            await i.response.send_message("❌ Produto-base não encontrado.", ephemeral=True)
-            return
-        variants = get_checkout_variants(int(parent["id"]), i.guild.id)
-        if not variants:
-            await i.response.send_message(
-                f"ℹ️ **{parent['name']}** ainda não possui checkout agrupado.",
-                ephemeral=True,
-            )
-            return
-        lines = [
-            f"• **{_variant_label(row)}** → `#{row['local_id']}` • {row['name']} • **{money(row['price'])}**"
-            for row in variants
-        ]
-        await i.response.send_message(
-            "🛒 **Checkout agrupado**\n"
-            f"Produto-base: **{parent['name']}** (`#{produto_base}`)\n\n"
-            + "\n".join(lines),
-            ephemeral=True,
-        )
-
-    @app_commands.command(
-        name="checkout-variantes-remover",
-        description="Volta um produto-base para o checkout normal",
-    )
-    async def checkout_variants_remove(self, i: discord.Interaction, produto_base: int):
-        if ADMIN_CHECK and not await ADMIN_CHECK(i):
-            return
-        parent, _ = resolve_product_for_guild(produto_base, i.guild.id, repair=False)
-        if not parent:
-            await i.response.send_message("❌ Produto-base não encontrado.", ephemeral=True)
-            return
-        clear_checkout_variants(i.guild.id, int(parent["id"]))
-        await i.response.send_message(
-            f"✅ Checkout agrupado removido de **{parent['name']}**.",
-            ephemeral=True,
-        )
-
-    @app_commands.command(
         name="dashboard", description="Dashboard de faturamento e vendas"
     )
     async def dashboard(self, i: discord.Interaction):
@@ -7190,6 +7093,112 @@ class StreamerDashboardView(discord.ui.View):
         await i.response.edit_message(
             embed=embed,
             view=StreamerDashboardView(self.guild_id, self.streamer_user_id),
+        )
+
+
+
+class CheckoutVariantCommands(app_commands.Group):
+    def __init__(self):
+        super().__init__(
+            name="checkout",
+            description="Configuração do checkout agrupado Mensal/Permanente",
+        )
+
+    @app_commands.command(
+        name="variantes",
+        description="Coloca Mensal e Permanente dentro de um único carrinho",
+    )
+    @app_commands.describe(
+        produto_base="ID local que aparece no painel (ex: LOCK SENSI PRO)",
+        mensal="ID local do produto Mensal",
+        permanente="ID local do produto Permanente",
+    )
+    async def checkout_variants_configure(
+        self,
+        i: discord.Interaction,
+        produto_base: int,
+        mensal: int,
+        permanente: int,
+    ):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+
+        parent, _ = resolve_product_for_guild(produto_base, i.guild.id, repair=False)
+        monthly, _ = resolve_product_for_guild(mensal, i.guild.id, repair=False)
+        lifetime, _ = resolve_product_for_guild(permanente, i.guild.id, repair=False)
+        if not parent or not monthly or not lifetime:
+            await i.response.send_message(
+                "❌ Um dos IDs não existe neste servidor. Use `/loja produtos`.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            configure_checkout_variants(
+                i.guild.id,
+                int(parent["id"]),
+                int(monthly["id"]),
+                int(lifetime["id"]),
+            )
+        except Exception as exc:
+            await i.response.send_message(f"❌ {str(exc)[:700]}", ephemeral=True)
+            return
+
+        await i.response.send_message(
+            "✅ **Checkout agrupado configurado!**\n\n"
+            f"🛒 Produto exibido: **{parent['name']}** (`#{produto_base}`)\n"
+            f"📅 Mensal: **{monthly['name']}** (`#{mensal}`) • **{money(monthly['price'])}**\n"
+            f"♾️ Permanente: **{lifetime['name']}** (`#{permanente}`) • **{money(lifetime['price'])}**\n\n"
+            "Agora, ao abrir o produto-base, o bot cria **um único canal** e o cliente "
+            "escolhe Mensal/Permanente dentro dele. Se você mudar o preço dos produtos "
+            "Mensal/Permanente depois, o carrinho usa o valor novo automaticamente.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="status",
+        description="Mostra Mensal/Permanente ligados a um produto-base",
+    )
+    async def checkout_variants_status(self, i: discord.Interaction, produto_base: int):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+        parent, _ = resolve_product_for_guild(produto_base, i.guild.id, repair=False)
+        if not parent:
+            await i.response.send_message("❌ Produto-base não encontrado.", ephemeral=True)
+            return
+        variants = get_checkout_variants(int(parent["id"]), i.guild.id)
+        if not variants:
+            await i.response.send_message(
+                f"ℹ️ **{parent['name']}** ainda não possui checkout agrupado.",
+                ephemeral=True,
+            )
+            return
+        lines = [
+            f"• **{_variant_label(row)}** → `#{row['local_id']}` • {row['name']} • **{money(row['price'])}**"
+            for row in variants
+        ]
+        await i.response.send_message(
+            "🛒 **Checkout agrupado**\n"
+            f"Produto-base: **{parent['name']}** (`#{produto_base}`)\n\n"
+            + "\n".join(lines),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="remover",
+        description="Volta um produto-base para o checkout normal",
+    )
+    async def checkout_variants_remove(self, i: discord.Interaction, produto_base: int):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+        parent, _ = resolve_product_for_guild(produto_base, i.guild.id, repair=False)
+        if not parent:
+            await i.response.send_message("❌ Produto-base não encontrado.", ephemeral=True)
+            return
+        clear_checkout_variants(i.guild.id, int(parent["id"]))
+        await i.response.send_message(
+            f"✅ Checkout agrupado removido de **{parent['name']}**.",
+            ephemeral=True,
         )
 
 
@@ -7647,6 +7656,7 @@ async def setup(bot, admin_check=None):
 
     for command_group in (
         CheckoutCommands(),
+        CheckoutVariantCommands(),
         CouponCommands(),
         AffiliateCommands(),
         MisticPayCommands(),
