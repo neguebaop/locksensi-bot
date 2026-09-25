@@ -25,6 +25,14 @@ ADMIN_CHECK = None
 LICENSE_ORDER_LOCKS = {}
 HWID_RESET_LOCKS = {}
 
+# Logo exibida na parte de BAIXO do card do carrinho quando o produto
+# possui as opções Mensal/Permanente. Pode ser sobrescrita por variável
+# de ambiente sem precisar alterar o código.
+LOCKSENSI_LOGO_PATH = os.getenv(
+    "LOCKSENSI_LOGO_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "locksensi_logo.png"),
+).strip()
+
 # Permissão especial para geração MANUAL de keys.
 # A geração automática após pagamento continua funcionando para clientes.
 LOCKSENSI_OWNER_ID = 1014602631689273444
@@ -63,6 +71,53 @@ def init_db():
     ensure_affiliate_schema()
     ensure_feedback_schema()
     ensure_license_schema()
+    ensure_checkout_variant_schema()
+
+
+def ensure_checkout_variant_schema():
+    """
+    Variações internas do checkout.
+
+    Exemplo:
+      produto-base: LOCK SENSI ANDROID
+      mensal:       LOCK SENSI ANDROID MENSAL
+      permanente:   LOCK SENSI ANDROID PERMANENTE
+
+    O cliente abre UM único carrinho pelo produto-base e escolhe a
+    validade dentro do próprio canal, sem criar outro carrinho.
+    """
+    con = db()
+    try:
+        con._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS checkout_variants(
+                id BIGSERIAL PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                parent_product_id BIGINT NOT NULL,
+                variant_key TEXT NOT NULL,
+                variant_product_id BIGINT NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(parent_product_id, variant_key)
+            )
+            """
+        )
+        con._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_checkout_variants_parent
+            ON checkout_variants(guild_id,parent_product_id,sort_order,id)
+            """
+        )
+        con._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_checkout_variants_child
+            ON checkout_variants(guild_id,variant_product_id)
+            """
+        )
+        con.commit()
+    finally:
+        con.close()
 
 
 def ensure_feedback_schema():
@@ -1229,6 +1284,130 @@ def resolve_split_panel(guild_id, value):
     return None
 
 
+def normalize_variant_key(value):
+    value = re.sub(r"[^a-z0-9_-]+", "", str(value or "").strip().lower())
+    return value[:32]
+
+
+def get_checkout_variants(parent_product_id, guild_id=None, active_only=False):
+    """Retorna os produtos-filhos usados como Mensal/Permanente no carrinho."""
+    parent_product_id = int(parent_product_id)
+    con = db()
+    try:
+        query = """
+            SELECT
+                cv.id AS checkout_variant_id,
+                cv.variant_key,
+                cv.sort_order,
+                cv.parent_product_id,
+                p.*
+            FROM checkout_variants cv
+            JOIN products p ON p.id=cv.variant_product_id
+            WHERE cv.parent_product_id=?
+        """
+        args = [parent_product_id]
+        if guild_id is not None:
+            query += " AND cv.guild_id=? AND p.guild_id=?"
+            args.extend([int(guild_id), int(guild_id)])
+        if active_only:
+            query += " AND p.active=1 AND p.stock<>0"
+        query += " ORDER BY cv.sort_order ASC,cv.id ASC"
+        return con.execute(query, tuple(args)).fetchall()
+    finally:
+        con.close()
+
+
+def get_checkout_variant_parent(product_id, guild_id=None):
+    """Se product_id for uma variação, retorna o produto-base correspondente."""
+    con = db()
+    try:
+        query = """
+            SELECT p.*
+            FROM checkout_variants cv
+            JOIN products p ON p.id=cv.parent_product_id
+            WHERE cv.variant_product_id=?
+        """
+        args = [int(product_id)]
+        if guild_id is not None:
+            query += " AND cv.guild_id=? AND p.guild_id=?"
+            args.extend([int(guild_id), int(guild_id)])
+        query += " ORDER BY cv.id DESC LIMIT 1"
+        return con.execute(query, tuple(args)).fetchone()
+    finally:
+        con.close()
+
+
+def configure_checkout_variants(guild_id, parent_product_id, monthly_product_id, permanent_product_id):
+    """Configura as duas opções do produto-base de forma atômica."""
+    guild_id = int(guild_id)
+    parent_product_id = int(parent_product_id)
+    monthly_product_id = int(monthly_product_id)
+    permanent_product_id = int(permanent_product_id)
+
+    if len({parent_product_id, monthly_product_id, permanent_product_id}) != 3:
+        raise ValueError("Produto-base, mensal e permanente precisam ser produtos diferentes.")
+
+    con = db()
+    try:
+        rows = con.execute(
+            "SELECT id,guild_id FROM products WHERE id IN (?,?,?)",
+            (parent_product_id, monthly_product_id, permanent_product_id),
+        ).fetchall()
+        if len(rows) != 3 or any(int(row["guild_id"]) != guild_id for row in rows):
+            raise ValueError("Todos os produtos precisam pertencer ao mesmo servidor.")
+
+        # Evita árvore de variantes/nesting acidental.
+        nested = con.execute(
+            """
+            SELECT 1 FROM checkout_variants
+            WHERE guild_id=?
+              AND parent_product_id IN (?,?)
+            LIMIT 1
+            """,
+            (guild_id, monthly_product_id, permanent_product_id),
+        ).fetchone()
+        if nested:
+            raise ValueError("Mensal/Permanente não podem ser produtos-base de outro checkout.")
+
+        con.execute(
+            "DELETE FROM checkout_variants WHERE guild_id=? AND parent_product_id=?",
+            (guild_id, parent_product_id),
+        )
+        con.execute(
+            """
+            INSERT INTO checkout_variants(
+                guild_id,parent_product_id,variant_key,variant_product_id,
+                sort_order,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (guild_id, parent_product_id, "mensal", monthly_product_id, 1, now_iso(), now_iso()),
+        )
+        con.execute(
+            """
+            INSERT INTO checkout_variants(
+                guild_id,parent_product_id,variant_key,variant_product_id,
+                sort_order,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (guild_id, parent_product_id, "permanente", permanent_product_id, 2, now_iso(), now_iso()),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def clear_checkout_variants(guild_id, parent_product_id):
+    con = db()
+    try:
+        con.execute(
+            "DELETE FROM checkout_variants WHERE guild_id=? AND parent_product_id=?",
+            (int(guild_id), int(parent_product_id)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
 def get_panel_products(guild_id, panel_id, active_only=False):
     con = db()
     try:
@@ -1376,6 +1555,23 @@ def find_matching_split_group(product):
     panel_rule = find_panel_split_group(product)
     if panel_rule:
         return panel_rule
+
+    # Checkout agrupado: se Mensal/Permanente não estiverem diretamente
+    # ligados ao painel público, herdam o split do produto-base. Isso permite
+    # mostrar somente LOCK SENSI ANDROID / LOCK SENSI PRO na lista externa
+    # sem perder a divisão configurada no painel.
+    guild_id = int(_row_value(product, "guild_id", 0) or 0)
+    product_id = int(_row_value(product, "id", 0) or 0)
+    if guild_id and product_id:
+        parent = get_checkout_variant_parent(product_id, guild_id)
+        if parent:
+            parent_panel_rule = find_panel_split_group(parent)
+            if parent_panel_rule:
+                inherited = dict(parent_panel_rule)
+                inherited["source"] = "painel"
+                inherited["group"] = parent_panel_rule.get("group")
+                inherited["inherited_from_parent"] = int(parent["id"])
+                return inherited
 
     # Compatibilidade: regras antigas por nome-base continuam funcionando.
     guild_id = int(_row_value(product, "guild_id", 0) or 0)
@@ -1987,12 +2183,215 @@ class LinkView(discord.ui.View):
         self.add_item(discord.ui.Button(label="🛒 Ir para o Carrinho", url=url))
 
 
+async def _send_logo_cart_message(channel, content=None, embed=None, view=None):
+    """
+    Envia o card com a logo como imagem GRANDE embaixo do embed.
+    Nunca usa thumbnail, portanto a logo não fica na lateral.
+    """
+    kwargs = {"content": content, "embed": embed, "view": view}
+    if LOCKSENSI_LOGO_PATH and os.path.isfile(LOCKSENSI_LOGO_PATH):
+        filename = "locksensi-logo.png"
+        if embed is not None:
+            embed.set_image(url=f"attachment://{filename}")
+        kwargs["file"] = discord.File(LOCKSENSI_LOGO_PATH, filename=filename)
+    return await channel.send(**kwargs)
+
+
+def _variant_label(row):
+    key = normalize_variant_key(_row_value(row, "variant_key", ""))
+    if key == "mensal":
+        return "MENSAL"
+    if key == "permanente":
+        return "PERMANENTE"
+    return str(_row_value(row, "name", "Opção") or "Opção").upper()[:40]
+
+
+def _variant_description(row):
+    key = normalize_variant_key(_row_value(row, "variant_key", ""))
+    if key == "mensal":
+        days = int(_row_value(row, "license_duration_days", 30) or 30)
+        return f"Acesso por {days} dia(s)" if days > 0 else "Acesso mensal"
+    if key == "permanente":
+        return "Acesso vitalício"
+    return "Opção do produto"
+
+
+def build_variant_picker_embed(parent, variants, selected_id=None):
+    title = f"🛒 {str(parent['name']).upper()} | Sistema de compra"
+    lines = [
+        "📣 Escolha abaixo o tipo de acesso que você deseja.",
+        "O valor é puxado automaticamente do produto configurado no painel.",
+        "",
+    ]
+
+    for row in variants:
+        selected = selected_id is not None and int(row["id"]) == int(selected_id)
+        mark = "✅" if selected else ("📅" if normalize_variant_key(row["variant_key"]) == "mensal" else "♾️")
+        availability = (
+            "disponível"
+            if int(_row_value(row, "active", 0) or 0) == 1 and int(_row_value(row, "stock", 0) or 0) != 0
+            else "indisponível"
+        )
+        lines.append(
+            f"{mark} **{_variant_label(row)}** — **{money(row['price'])}**\n"
+            f"└ {_variant_description(row)} • {availability}"
+        )
+        lines.append("")
+
+    if selected_id is not None:
+        lines.append("✅ Opção selecionada. Continue pelos botões abaixo do carrinho.")
+    else:
+        lines.append("Toque em **Mensal** ou **Permanente** para montar o carrinho.")
+
+    return discord.Embed(
+        title=title,
+        description="\n".join(lines)[:4000],
+        color=0xE31B2B,
+    )
+
+
+class CheckoutVariantView(discord.ui.View):
+    def __init__(self, parent_id, uid, variants):
+        super().__init__(timeout=1800)
+        self.parent_id = int(parent_id)
+        self.uid = int(uid)
+        self.variants = list(variants)[:5]
+
+        for row in self.variants:
+            key = normalize_variant_key(row["variant_key"])
+            label = _variant_label(row)
+            emoji = "📅" if key == "mensal" else ("♾️" if key == "permanente" else "🛒")
+            disabled = not (
+                int(_row_value(row, "active", 0) or 0) == 1
+                and int(_row_value(row, "stock", 0) or 0) != 0
+            )
+            button = discord.ui.Button(
+                label=f"{label} • {money(row['price'])}"[:80],
+                emoji=emoji,
+                style=(
+                    discord.ButtonStyle.success
+                    if key == "mensal"
+                    else discord.ButtonStyle.primary
+                ),
+                disabled=disabled,
+                custom_id=f"checkout:variant:{self.parent_id}:{int(row['id'])}:{key}"[:100],
+            )
+
+            async def callback(interaction, product_id=int(row["id"])):
+                await self.choose(interaction, product_id)
+
+            button.callback = callback
+            self.add_item(button)
+
+    async def choose(self, i, product_id):
+        if int(i.user.id) != self.uid:
+            await i.response.send_message(
+                "❌ Este carrinho pertence a outra pessoa.", ephemeral=True
+            )
+            return
+
+        parent = get_product(self.parent_id)
+        variants = get_checkout_variants(self.parent_id, i.guild.id)
+        selected = next((row for row in variants if int(row["id"]) == int(product_id)), None)
+        if not parent or not selected:
+            await i.response.send_message("❌ Esta opção não existe mais.", ephemeral=True)
+            return
+        if int(selected["active"] or 0) != 1 or int(selected["stock"] or 0) == 0:
+            await i.response.send_message("❌ Esta opção está indisponível no momento.", ephemeral=True)
+            return
+
+        # Se o administrador alterou o preço enquanto o carrinho estava aberto,
+        # tudo abaixo usa o valor ATUAL do banco.
+        clear_cart_coupon(i.channel.id)
+        try:
+            await i.channel.edit(
+                topic=f"user={self.uid};product={int(selected['id'])};parent={self.parent_id};variant={normalize_variant_key(selected['variant_key'])}"
+            )
+        except Exception:
+            pass
+
+        # Recria a View com preços atuais e trava a escolha para impedir
+        # dois fluxos de pagamento no mesmo canal.
+        locked_view = CheckoutVariantView(self.parent_id, self.uid, variants)
+        for child in locked_view.children:
+            child.disabled = True
+
+        await i.response.edit_message(
+            embed=build_variant_picker_embed(parent, variants, selected_id=int(selected["id"])),
+            view=locked_view,
+        )
+
+        intro = discord.Embed(
+            title="ENTREGAS AUTOMÁTICAS | Sistema de compra",
+            description=(
+                f"📣 {i.user.mention}, você escolheu **{_variant_label(selected)}** por "
+                f"**{money(selected['price'])}**.\n\n"
+                "📕 Leia os termos antes de continuar.\n\n"
+                "🔐 **Por exigência da instituição financeira, precisamos do CPF apenas "
+                "para emissão do PIX. O dado não será publicado no servidor.**"
+            ),
+            color=0x8B2CF5,
+        )
+        await i.channel.send(
+            embed=intro,
+            view=StartView(int(selected["id"]), self.uid),
+        )
+
+        pricing = get_cart_pricing(i.channel.id, i.guild.id, selected["price"])
+        item = build_cart_item_embed(selected, pricing)
+        item.add_field(
+            name="Tipo de acesso",
+            value=f"`{_variant_label(selected)}`",
+            inline=False,
+        )
+        await i.channel.send(
+            embed=item,
+            view=CartItemView(int(selected["id"]), self.uid),
+        )
+
+
 async def open_cart(interaction, product_id):
     p = get_product(product_id)
-    if not p or not p["active"] or p["stock"] == 0:
+    if not p or int(p["active"] or 0) != 1:
         await interaction.followup.send("❌ Produto indisponível.", ephemeral=True)
         return
+
     guild = interaction.guild
+
+    # Se alguém chamar open_cart() diretamente usando um produto-filho,
+    # volta automaticamente para o produto-base. Assim o cliente sempre vê
+    # Mensal/Permanente antes de continuar.
+    parent = get_checkout_variant_parent(int(p["id"]), guild.id)
+    if parent:
+        p = parent
+        product_id = int(parent["id"])
+
+    variants = get_checkout_variants(product_id, guild.id)
+    grouped_checkout = len(variants) > 0
+
+    if grouped_checkout and len(variants) < 2:
+        await interaction.followup.send(
+            "❌ O checkout deste produto está incompleto. Configure Mensal e Permanente com `/loja checkout-variantes`.",
+            ephemeral=True,
+        )
+        return
+
+    if grouped_checkout:
+        available = [
+            row
+            for row in variants
+            if int(row["active"] or 0) == 1 and int(row["stock"] or 0) != 0
+        ]
+        if not available:
+            await interaction.followup.send(
+                "❌ Mensal e Permanente estão indisponíveis no momento.",
+                ephemeral=True,
+            )
+            return
+    elif int(p["stock"] or 0) == 0:
+        await interaction.followup.send("❌ Produto indisponível.", ephemeral=True)
+        return
+
     cfg = get_cfg(guild.id)
     cat = (
         guild.get_channel(cfg["cart_category_id"])
@@ -2010,6 +2409,8 @@ async def open_cart(interaction, product_id):
         )
         con.commit()
         con.close()
+
+    # UM carrinho por cliente. Escolher Mensal/Permanente não cria outro canal.
     existing = next(
         (
             c
@@ -2023,6 +2424,7 @@ async def open_cart(interaction, product_id):
             f"Você já tem um carrinho: {existing.mention}", ephemeral=True
         )
         return
+
     ow = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
         interaction.user: discord.PermissionOverwrite(
@@ -2036,8 +2438,9 @@ async def open_cart(interaction, product_id):
         f"carrinho-{interaction.user.id}",
         category=cat,
         overwrites=ow,
-        topic=f"user={interaction.user.id};product={product_id}",
+        topic=f"user={interaction.user.id};product={product_id};grouped={1 if grouped_checkout else 0}",
     )
+
     e = discord.Embed(
         title="ENTREGAS AUTOMÁTICAS | Carrinho aberto",
         description=f"✅ {interaction.user.mention}, seu carrinho foi aberto com sucesso.",
@@ -2045,6 +2448,18 @@ async def open_cart(interaction, product_id):
     )
     channel_url = f"https://discord.com/channels/{guild.id}/{ch.id}"
     await interaction.followup.send(embed=e, view=LinkView(channel_url), ephemeral=True)
+
+    if grouped_checkout:
+        picker = build_variant_picker_embed(p, variants)
+        await _send_logo_cart_message(
+            ch,
+            content=interaction.user.mention,
+            embed=picker,
+            view=CheckoutVariantView(product_id, interaction.user.id, variants),
+        )
+        return
+
+    # Checkout antigo continua 100% compatível para produtos sem variantes.
     intro = discord.Embed(
         title="ENTREGAS AUTOMÁTICAS | Sistema de compra",
         description=f"📣 Olá {interaction.user.mention}, confira seu produto abaixo.\n\n📕 Leia os termos antes de continuar.\n\n🔐 **Por exigência da instituição financeira, precisamos do CPF apenas para emissão do PIX. O dado não será publicado no servidor.**",
@@ -2829,7 +3244,8 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
             )
             e.add_field(
                 name="📋 PIX copia e cola",
-                value=f"```{cp[:950]}```",
+                # Sem ``` para o cliente nunca copiar crases junto com o PIX.
+                value=(cp[:1024] or "Código PIX indisponível"),
                 inline=False,
             )
             if file:
@@ -2894,9 +3310,9 @@ class VerifyView(discord.ui.View):
             )
             return
 
-        # Envia somente o payload original. Alterar/remover caracteres pode
-        # invalidar o PIX; o bloco do Discord oferece o ícone de copiar.
-        await i.response.send_message(f"```{pix_code[:1900]}```", ephemeral=True)
+        # Envia SOMENTE o payload original, sem ``` e sem qualquer caractere
+        # extra. Isso evita o cliente copiar crases junto com o PIX.
+        await i.response.send_message(pix_code[:1900], ephemeral=True)
 
 
 async def process_subowner_payout(oid):
@@ -6287,6 +6703,103 @@ class CheckoutCommands(app_commands.Group):
         await i.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(
+        name="checkout-variantes",
+        description="Coloca Mensal e Permanente dentro de um único carrinho",
+    )
+    @app_commands.describe(
+        produto_base="ID local que aparece no painel (ex: LOCK SENSI PRO)",
+        mensal="ID local do produto Mensal",
+        permanente="ID local do produto Permanente",
+    )
+    async def checkout_variants_configure(
+        self,
+        i: discord.Interaction,
+        produto_base: int,
+        mensal: int,
+        permanente: int,
+    ):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+
+        parent, _ = resolve_product_for_guild(produto_base, i.guild.id, repair=False)
+        monthly, _ = resolve_product_for_guild(mensal, i.guild.id, repair=False)
+        lifetime, _ = resolve_product_for_guild(permanente, i.guild.id, repair=False)
+        if not parent or not monthly or not lifetime:
+            await i.response.send_message(
+                "❌ Um dos IDs não existe neste servidor. Use `/loja produtos`.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            configure_checkout_variants(
+                i.guild.id,
+                int(parent["id"]),
+                int(monthly["id"]),
+                int(lifetime["id"]),
+            )
+        except Exception as exc:
+            await i.response.send_message(f"❌ {str(exc)[:700]}", ephemeral=True)
+            return
+
+        await i.response.send_message(
+            "✅ **Checkout agrupado configurado!**\n\n"
+            f"🛒 Produto exibido: **{parent['name']}** (`#{produto_base}`)\n"
+            f"📅 Mensal: **{monthly['name']}** (`#{mensal}`) • **{money(monthly['price'])}**\n"
+            f"♾️ Permanente: **{lifetime['name']}** (`#{permanente}`) • **{money(lifetime['price'])}**\n\n"
+            "Agora, ao abrir o produto-base, o bot cria **um único canal** e o cliente "
+            "escolhe Mensal/Permanente dentro dele. Se você mudar o preço dos produtos "
+            "Mensal/Permanente depois, o carrinho usa o valor novo automaticamente.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="checkout-variantes-status",
+        description="Mostra Mensal/Permanente ligados a um produto-base",
+    )
+    async def checkout_variants_status(self, i: discord.Interaction, produto_base: int):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+        parent, _ = resolve_product_for_guild(produto_base, i.guild.id, repair=False)
+        if not parent:
+            await i.response.send_message("❌ Produto-base não encontrado.", ephemeral=True)
+            return
+        variants = get_checkout_variants(int(parent["id"]), i.guild.id)
+        if not variants:
+            await i.response.send_message(
+                f"ℹ️ **{parent['name']}** ainda não possui checkout agrupado.",
+                ephemeral=True,
+            )
+            return
+        lines = [
+            f"• **{_variant_label(row)}** → `#{row['local_id']}` • {row['name']} • **{money(row['price'])}**"
+            for row in variants
+        ]
+        await i.response.send_message(
+            "🛒 **Checkout agrupado**\n"
+            f"Produto-base: **{parent['name']}** (`#{produto_base}`)\n\n"
+            + "\n".join(lines),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="checkout-variantes-remover",
+        description="Volta um produto-base para o checkout normal",
+    )
+    async def checkout_variants_remove(self, i: discord.Interaction, produto_base: int):
+        if ADMIN_CHECK and not await ADMIN_CHECK(i):
+            return
+        parent, _ = resolve_product_for_guild(produto_base, i.guild.id, repair=False)
+        if not parent:
+            await i.response.send_message("❌ Produto-base não encontrado.", ephemeral=True)
+            return
+        clear_checkout_variants(i.guild.id, int(parent["id"]))
+        await i.response.send_message(
+            f"✅ Checkout agrupado removido de **{parent['name']}**.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
         name="dashboard", description="Dashboard de faturamento e vendas"
     )
     async def dashboard(self, i: discord.Interaction):
@@ -6428,6 +6941,10 @@ class CheckoutCommands(app_commands.Group):
         if definitivo and used == 0:
             con.execute(
                 "DELETE FROM panel_products WHERE product_id=?", (global_product_id,)
+            )
+            con.execute(
+                "DELETE FROM checkout_variants WHERE parent_product_id=? OR variant_product_id=?",
+                (global_product_id, global_product_id),
             )
             con.execute("DELETE FROM products WHERE id=?", (global_product_id,))
             msg = "Excluído definitivamente."
