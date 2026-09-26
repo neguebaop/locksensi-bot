@@ -1245,6 +1245,9 @@ async def on_ready():
         if not getattr(bot, "_utility_setup_done", False):
             await utility_system.setup(bot, protected_admin_only)
             bot._utility_setup_done = True
+        if not getattr(bot, "_locksensi_integrated_setup_done", False):
+            await setup_locksensi_integrated(bot, protected_admin_only)
+            bot._locksensi_integrated_setup_done = True
         # Faz a limpeza dos comandos locais antigos apenas uma vez por inicialização.
         # Isso evita que versões antigas dos slash commands continuem salvas
         # em servidores específicos e causem TransformerError.
@@ -2784,6 +2787,744 @@ async def on_app_command_error(
             "[ERRO AO RESPONDER INTERAÇÃO] "
             f"{type(response_error).__name__}: {response_error}"
         )
+
+
+
+
+# ============================================================================
+# LOCK SENSI INTEGRADO — TICKET PREMIUM + GERADOR DE SENSI + LISTAR PAINÉIS
+# Não precisa de locksensi_extras.py. Tudo abaixo faz parte deste bot.py.
+# ============================================================================
+from datetime import timezone as _lsx_timezone
+
+LSX_BOT = None
+LSX_ADMIN_CHECK = None
+LSX_BLACK = 0x111111
+LSX_TICKET_BANNER = os.getenv("TICKET_IMAGE_URL", "").strip()
+LSX_SENSI_BANNER = os.getenv("SENSI_BANNER_URL", "").strip()
+
+
+def lsx_now_iso():
+    return datetime.now(_lsx_timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def lsx_valid_url(v):
+    return bool(v and re.match(r"^https?://", str(v).strip(), re.I))
+
+
+def lsx_platform_label(v):
+    v = str(v or "").lower().strip()
+    return {"tiktok": "TikTok", "instagram": "Instagram", "discord": "Discord"}.get(v, v.title() or "rede social")
+
+
+def lsx_ensure_schema():
+    con = db()
+    try:
+        con._conn.execute("""
+            CREATE TABLE IF NOT EXISTS sensi_config(
+                guild_id BIGINT PRIMARY KEY,
+                access_role_id BIGINT NULL,
+                proof_channel_id BIGINT NULL,
+                verification_platform TEXT NOT NULL DEFAULT 'tiktok',
+                verification_url TEXT NULL,
+                banner_url TEXT NULL,
+                cooldown_seconds INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        con._conn.execute("""
+            CREATE TABLE IF NOT EXISTS sensi_requests(
+                id BIGSERIAL PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                profile_text TEXT NULL,
+                proof_text TEXT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                reviewed_by BIGINT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        con._conn.execute("""
+            CREATE TABLE IF NOT EXISTS sensi_generations(
+                id BIGSERIAL PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                platform TEXT NOT NULL,
+                device_name TEXT NULL,
+                style_name TEXT NULL,
+                payload TEXT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        con.commit()
+    finally:
+        con.close()
+
+
+def lsx_get_cfg(guild_id):
+    lsx_ensure_schema()
+    con = db()
+    try:
+        return con.execute("SELECT * FROM sensi_config WHERE guild_id=?", (int(guild_id),)).fetchone()
+    finally:
+        con.close()
+
+
+def lsx_save_cfg(guild_id, role_id, channel_id, platform, url, banner, cooldown):
+    con = db()
+    try:
+        con.execute("""
+            INSERT INTO sensi_config(
+                guild_id,access_role_id,proof_channel_id,verification_platform,
+                verification_url,banner_url,cooldown_seconds,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                access_role_id=excluded.access_role_id,
+                proof_channel_id=excluded.proof_channel_id,
+                verification_platform=excluded.verification_platform,
+                verification_url=excluded.verification_url,
+                banner_url=excluded.banner_url,
+                cooldown_seconds=excluded.cooldown_seconds,
+                updated_at=excluded.updated_at
+        """, (int(guild_id), int(role_id), int(channel_id), platform, url or "", banner or "", max(0, int(cooldown)), lsx_now_iso()))
+        con.commit()
+    finally:
+        con.close()
+
+
+def lsx_is_staff(interaction):
+    p = getattr(interaction.user, "guild_permissions", None)
+    return bool(p and (p.administrator or p.manage_guild or p.manage_channels))
+
+
+async def lsx_has_access(interaction, notify=True):
+    if not interaction.guild:
+        if notify:
+            await interaction.response.send_message("❌ Use este recurso dentro do servidor.", ephemeral=True)
+        return False
+    if lsx_is_staff(interaction):
+        return True
+    cfg = lsx_get_cfg(interaction.guild.id)
+    if not cfg or not cfg["access_role_id"]:
+        if notify:
+            await interaction.response.send_message("🔒 O gerador ainda não foi configurado.", ephemeral=True)
+        return False
+    role = interaction.guild.get_role(int(cfg["access_role_id"]))
+    if role and role in getattr(interaction.user, "roles", []):
+        return True
+    if notify:
+        await interaction.response.send_message(
+            f"🔒 Você ainda não tem acesso. Use **✅ Validar Acesso** e envie a prova de que seguiu a Lock Sensi no **{lsx_platform_label(cfg['verification_platform'])}**.",
+            ephemeral=True,
+        )
+    return False
+
+
+# ---------------- TICKETS ----------------
+LSX_TICKET_DESC = (
+    "Precisa de ajuda com **compra, acesso, instalação** ou tem alguma dúvida sobre nossos produtos?\n\n"
+    "Abra um ticket e fale com a equipe da **Lock Sensi**.\n"
+    "Selecione abaixo o tipo de atendimento desejado."
+)
+
+
+class LSXTicketOpenButton(discord.ui.Button):
+    def __init__(self, tipo, label, style, custom_id):
+        super().__init__(label=label, style=style, custom_id=custom_id)
+        self.tipo = tipo
+
+    async def callback(self, interaction):
+        await lsx_create_ticket(interaction, self.tipo)
+
+
+class LSXPremiumTicketPanel(discord.ui.LayoutView):
+    def __init__(self, titulo="PAINEL DE ATENDIMENTO LOCK SENSI", descricao=LSX_TICKET_DESC, imagem=None):
+        super().__init__(timeout=None)
+        c = discord.ui.Container(accent_color=LSX_BLACK)
+        img = str(imagem or LSX_TICKET_BANNER or "").strip()
+        if lsx_valid_url(img):
+            g = discord.ui.MediaGallery()
+            g.add_item(media=img, description="Lock Sensi • Atendimento")
+            c.add_item(g)
+            c.add_item(discord.ui.Separator(visible=True))
+        c.add_item(discord.ui.TextDisplay(f"## {titulo}"))
+        c.add_item(discord.ui.Separator(visible=True))
+        c.add_item(discord.ui.TextDisplay(descricao[:3900]))
+        c.add_item(discord.ui.Separator(visible=True))
+        c.add_item(discord.ui.TextDisplay("-# Lock Sensi • Atendimento rápido e organizado"))
+        self.add_item(c)
+        self.add_item(discord.ui.ActionRow(
+            LSXTicketOpenButton("suporte", "🎧 Suporte", discord.ButtonStyle.primary, "ls_ticket_suporte_v1"),
+            LSXTicketOpenButton("duvidas", "❓ Dúvidas", discord.ButtonStyle.secondary, "ls_ticket_duvidas_v1"),
+            LSXTicketOpenButton("streamers", "🎥 Streamers", discord.ButtonStyle.success, "ls_ticket_streamers_v1"),
+        ))
+
+
+class LSXTicketControls(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="📌 Assumir", style=discord.ButtonStyle.secondary, custom_id="ls_ticket_take_v1")
+    async def take(self, interaction, button):
+        if not lsx_is_staff(interaction):
+            await interaction.response.send_message("❌ Apenas a equipe pode assumir o ticket.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"📌 Atendimento assumido por {interaction.user.mention}.")
+
+    @discord.ui.button(label="✅ Resolver", style=discord.ButtonStyle.success, custom_id="ls_ticket_resolve_v1")
+    async def resolve(self, interaction, button):
+        if not lsx_is_staff(interaction):
+            await interaction.response.send_message("❌ Apenas a equipe pode finalizar o ticket.", ephemeral=True)
+            return
+        await interaction.response.send_message("✅ Atendimento concluído. Fechando em 5 segundos...")
+        import asyncio
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete(reason=f"Ticket resolvido por {interaction.user}")
+        except Exception:
+            pass
+
+    @discord.ui.button(label="🔒 Fechar", style=discord.ButtonStyle.danger, custom_id="ls_ticket_close_v1")
+    async def close(self, interaction, button):
+        await interaction.response.send_message("🔒 Fechando em 5 segundos...", ephemeral=True)
+        import asyncio
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete(reason=f"Ticket fechado por {interaction.user}")
+        except Exception:
+            pass
+
+
+async def lsx_create_ticket(interaction, tipo):
+    await interaction.response.defer(ephemeral=True)
+    guild, user = interaction.guild, interaction.user
+    category_name = os.getenv("TICKET_CATEGORY_NAME", "tickets")
+    category = discord.utils.get(guild.categories, name=category_name)
+    if not category:
+        category = await guild.create_category(category_name)
+
+    for ch in category.text_channels:
+        if ch.name.startswith(f"{tipo}-") and f"user_id:{user.id}" in (ch.topic or ""):
+            await interaction.followup.send(f"⚠️ Você já tem um ticket aberto: {ch.mention}", ephemeral=True)
+            return
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True),
+    }
+    safe = re.sub(r"[^a-zA-Z0-9_-]+", "-", user.name).strip("-").lower()
+    ch = await guild.create_text_channel(
+        f"{tipo}-{safe}"[:90], category=category, overwrites=overwrites,
+        topic=f"Lock Sensi | tipo:{tipo} | user_id:{user.id}"
+    )
+
+    if tipo == "streamers":
+        body = "**Para agilizar, envie:**\n• Link do TikTok/Instagram\n• Seguidores\n• Média de views ou público da live\n• Como pretende divulgar a Lock Sensi"
+        label = "🎥 STREAMERS"
+    elif tipo == "suporte":
+        body = "**Para agilizar, envie:**\n• Produto utilizado\n• O que aconteceu\n• Print/vídeo do problema\n• Informações do PC ou celular"
+        label = "🎧 SUPORTE"
+    else:
+        body = "Envie sua dúvida com detalhes. Se for sobre um produto, informe também o nome dele."
+        label = "❓ DÚVIDAS"
+
+    embed = discord.Embed(
+        title="LOCK SENSI • ATENDIMENTO",
+        description=f"Olá, {user.mention}. Seu atendimento foi aberto com sucesso.\n\n**Categoria:** {label}\n\n{body}\n\nNossa equipe responderá assim que possível.",
+        color=LSX_BLACK,
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    if lsx_valid_url(LSX_TICKET_BANNER):
+        embed.set_image(url=LSX_TICKET_BANNER)
+    embed.set_footer(text="Lock Sensi • Atendimento Premium")
+    await ch.send(content=user.mention, embed=embed, view=LSXTicketControls())
+    await interaction.followup.send(f"✅ Ticket criado: {ch.mention}", ephemeral=True)
+
+
+# ---------------- SENSI ----------------
+def lsx_style_key(v):
+    v = str(v or "").lower()
+    if any(x in v for x in ("control", "pesad", "precis")):
+        return "controle"
+    if any(x in v for x in ("rapid", "alta", "leve")):
+        return "rapida"
+    return "equilibrada"
+
+
+def lsx_pick(rng, a, b):
+    return rng.randint(a, b)
+
+
+def lsx_generate_sensi(platform, device, style):
+    rng = random.SystemRandom()
+    style = lsx_style_key(style)
+    platform = platform.lower()
+
+    if platform == "android":
+        sets = {
+            "controle": [(150,175),(140,165),(125,150),(110,140),(45,70),(145,175),(440,580),(48,55)],
+            "equilibrada": [(170,190),(155,180),(140,170),(125,155),(55,80),(160,190),(520,680),(50,57)],
+            "rapida": [(185,200),(175,195),(160,190),(145,175),(65,90),(180,200),(620,800),(52,60)],
+        }[style]
+        v = [lsx_pick(rng,*r) for r in sets]
+        return {"Plataforma":"Android","Aparelho":device,"Estilo":style.title(),"Geral":v[0],"Red Dot":v[1],"Mira 2x":v[2],"Mira 4x":v[3],"AWM":v[4],"Olhadinha":v[5],"DPI base":v[6],"Botão de atirar":f"{v[7]}%","Ajuste fino":"Se passar da cabeça, reduza Geral/Red Dot em 3–5 pontos."}
+
+    if platform == "ios":
+        sets = {
+            "controle": [(150,175),(140,165),(125,150),(110,140),(45,70),(145,175),(48,54),(52,65)],
+            "equilibrada": [(170,190),(155,180),(140,170),(125,155),(55,80),(160,190),(50,57),(60,75)],
+            "rapida": [(185,200),(175,195),(160,190),(145,175),(65,90),(180,200),(52,60),(68,82)],
+        }[style]
+        v = [lsx_pick(rng,*r) for r in sets]
+        return {"Plataforma":"iOS","Aparelho":device,"Estilo":style.title(),"Geral":v[0],"Red Dot":v[1],"Mira 2x":v[2],"Mira 4x":v[3],"AWM":v[4],"Olhadinha":v[5],"Botão de atirar":f"{v[6]}%","Rastreamento base":v[7],"Ciclos":3,"DPI":"Não se aplica ao iOS; use o ajuste de rastreamento.","Ajuste fino":"Teste no treino e altere 3–5 pontos por vez."}
+
+    sets = {
+        "controle": [(135,160),(125,150),(110,140),(95,125),(35,60),(135,165)],
+        "equilibrada": [(150,175),(140,165),(125,155),(110,140),(45,70),(150,180)],
+        "rapida": [(170,195),(160,185),(145,175),(130,160),(55,80),(170,195)],
+    }[style]
+    v = [lsx_pick(rng,*r) for r in sets]
+    return {"Plataforma":"Emulador / PC","Setup":device,"Estilo":style.title(),"Geral":v[0],"Red Dot":v[1],"Mira 2x":v[2],"Mira 4x":v[3],"AWM":v[4],"Olhadinha":v[5],"DPI do mouse":rng.choice([800,1000,1200,1600]),"Eixo X base":round(rng.uniform(.72,.96),2),"Eixo Y base":round(rng.uniform(.66,.92),2),"Windows":"6/11","Polling rate":"1000 Hz (se suportado)","Ajuste fino":"Se ficar rápida demais, reduza X/Y ou Geral em pequenos passos."}
+
+
+def lsx_sensi_embed(user, payload):
+    device = payload.get("Aparelho") or payload.get("Setup") or "Não informado"
+    lines = []
+    for k,v in payload.items():
+        if k not in ("Plataforma","Aparelho","Setup","Estilo","Ajuste fino"):
+            lines.append(f"**{k}:** `{v}`")
+    e = discord.Embed(
+        title=f"🎯 SENSI LOCK SENSI • {payload['Plataforma'].upper()}",
+        description=f"**Dispositivo:** `{device}`\n**Perfil:** `{payload['Estilo']}`\n\n" + "\n".join(lines) + f"\n\n**Ajuste recomendado:** {payload['Ajuste fino']}\n\n-# Base para teste; não garante resultado automático.",
+        color=LSX_BLACK,
+    )
+    e.set_thumbnail(url=user.display_avatar.url)
+    e.set_footer(text="Lock Sensi • Gerador de Sensibilidade")
+    return e
+
+
+class LSXDeviceModal(discord.ui.Modal):
+    def __init__(self, platform):
+        names = {"android":"Android","ios":"iOS","emulador":"Emulador"}
+        super().__init__(title=f"Gerar Sensi • {names.get(platform, platform)}")
+        self.platform = platform
+        self.device = discord.ui.TextInput(label="Celular / setup", placeholder="Ex: iPhone 13, Redmi Note 13 ou MSI + G203", max_length=120)
+        self.style = discord.ui.TextInput(label="Estilo", placeholder="controle, equilibrada ou rápida", default="equilibrada", max_length=30)
+        self.add_item(self.device)
+        self.add_item(self.style)
+
+    async def on_submit(self, interaction):
+        if not await lsx_has_access(interaction):
+            return
+
+        cfg = lsx_get_cfg(interaction.guild.id)
+        cooldown_seconds = int(cfg["cooldown_seconds"] or 0) if cfg else 0
+        if cooldown_seconds > 0 and not lsx_is_staff(interaction):
+            con = db()
+            try:
+                last = con.execute(
+                    "SELECT created_at FROM sensi_generations WHERE guild_id=? AND user_id=? ORDER BY id DESC LIMIT 1",
+                    (int(interaction.guild.id), int(interaction.user.id)),
+                ).fetchone()
+            finally:
+                con.close()
+            if last and last["created_at"]:
+                created = last["created_at"]
+                if isinstance(created, str):
+                    try:
+                        created = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    except Exception:
+                        created = None
+                if created is not None:
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=_lsx_timezone.utc)
+                    elapsed = (datetime.now(_lsx_timezone.utc) - created).total_seconds()
+                    remaining = int(cooldown_seconds - elapsed)
+                    if remaining > 0:
+                        await interaction.response.send_message(
+                            f"⏳ Aguarde **{remaining}s** para gerar outra sensi.",
+                            ephemeral=True,
+                        )
+                        return
+
+        payload = lsx_generate_sensi(self.platform, str(self.device).strip(), str(self.style).strip())
+        con = db()
+        try:
+            con.execute("INSERT INTO sensi_generations(guild_id,user_id,platform,device_name,style_name,payload,created_at) VALUES(?,?,?,?,?,?,?)", (interaction.guild.id, interaction.user.id, self.platform, str(self.device), str(self.style), str(payload), lsx_now_iso()))
+            con.commit()
+        finally:
+            con.close()
+        await interaction.response.send_message(embed=lsx_sensi_embed(interaction.user, payload), ephemeral=True)
+
+
+class LSXPlatformView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="📱 Android", style=discord.ButtonStyle.success)
+    async def android(self, interaction, button):
+        await interaction.response.send_modal(LSXDeviceModal("android"))
+
+    @discord.ui.button(label="🍎 iOS", style=discord.ButtonStyle.primary)
+    async def ios(self, interaction, button):
+        await interaction.response.send_modal(LSXDeviceModal("ios"))
+
+    @discord.ui.button(label="🖥️ Emulador", style=discord.ButtonStyle.secondary)
+    async def emu(self, interaction, button):
+        await interaction.response.send_modal(LSXDeviceModal("emulador"))
+
+
+class LSXProofModal(discord.ui.Modal, title="Validar acesso • Lock Sensi"):
+    perfil = discord.ui.TextInput(label="@ ou link do seu perfil", placeholder="@usuario ou https://...", max_length=200)
+    prova = discord.ui.TextInput(label="Comprovação", placeholder="Cole o link do print ou descreva a prova", style=discord.TextStyle.paragraph, max_length=1000)
+
+    async def on_submit(self, interaction):
+        cfg = lsx_get_cfg(interaction.guild.id)
+        if not cfg or not cfg["proof_channel_id"] or not cfg["access_role_id"]:
+            await interaction.response.send_message("❌ A validação ainda não foi configurada.", ephemeral=True)
+            return
+        role = interaction.guild.get_role(int(cfg["access_role_id"]))
+        if role and role in interaction.user.roles:
+            await interaction.response.send_message("✅ Seu acesso já está liberado.", ephemeral=True)
+            return
+
+        con = db()
+        try:
+            pending = con.execute(
+                "SELECT id FROM sensi_requests WHERE guild_id=? AND user_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                (int(interaction.guild.id), int(interaction.user.id)),
+            ).fetchone()
+        finally:
+            con.close()
+        if pending:
+            await interaction.response.send_message(
+                "⏳ Você já possui uma validação aguardando análise da equipe.",
+                ephemeral=True,
+            )
+            return
+
+        channel = interaction.guild.get_channel(int(cfg["proof_channel_id"]))
+        if not channel:
+            await interaction.response.send_message("❌ Canal de validação não encontrado.", ephemeral=True)
+            return
+        con = db()
+        try:
+            cur = con.cursor()
+            cur.execute("INSERT INTO sensi_requests(guild_id,user_id,profile_text,proof_text,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (interaction.guild.id, interaction.user.id, str(self.perfil), str(self.prova), "pending", lsx_now_iso(), lsx_now_iso()))
+            req_id = cur.lastrowid
+            con.commit()
+        finally:
+            con.close()
+        e = discord.Embed(title="✅ NOVA VALIDAÇÃO • SENSI", description=f"**Usuário:** {interaction.user.mention}\n**Plataforma:** {lsx_platform_label(cfg['verification_platform'])}\n**Perfil:** {str(self.perfil)[:400]}\n\n**Comprovação:**\n{str(self.prova)[:1400]}", color=0xF1C40F)
+        e.set_thumbnail(url=interaction.user.display_avatar.url)
+        e.set_footer(text=f"request_id:{req_id}")
+        await channel.send(embed=e, view=LSXApprovalView())
+        await interaction.response.send_message("📨 Comprovação enviada. Quando a staff aprovar, o cargo será entregue automaticamente.", ephemeral=True)
+
+
+def lsx_request_id_from_message(message):
+    try:
+        m = re.search(r"request_id:(\d+)", message.embeds[0].footer.text or "")
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+class LSXApprovalView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def get_request(self, interaction):
+        if not lsx_is_staff(interaction):
+            await interaction.response.send_message("❌ Apenas a equipe pode revisar.", ephemeral=True)
+            return None
+        rid = lsx_request_id_from_message(interaction.message)
+        if not rid:
+            await interaction.response.send_message("❌ Solicitação sem ID.", ephemeral=True)
+            return None
+        con = db()
+        try:
+            row = con.execute("SELECT * FROM sensi_requests WHERE id=?", (rid,)).fetchone()
+        finally:
+            con.close()
+        if not row or row["status"] != "pending":
+            await interaction.response.send_message("⚠️ Essa solicitação já foi finalizada ou não existe.", ephemeral=True)
+            return None
+        return row
+
+    @discord.ui.button(label="✅ Aprovar", style=discord.ButtonStyle.success, custom_id="ls_sensi_approve_v1")
+    async def approve(self, interaction, button):
+        row = await self.get_request(interaction)
+        if not row:
+            return
+        cfg = lsx_get_cfg(interaction.guild.id)
+        role = interaction.guild.get_role(int(cfg["access_role_id"])) if cfg and cfg["access_role_id"] else None
+        if not role:
+            await interaction.response.send_message("❌ Cargo de acesso não encontrado.", ephemeral=True)
+            return
+        member = interaction.guild.get_member(int(row["user_id"]))
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(int(row["user_id"]))
+            except Exception:
+                member = None
+        if not member:
+            await interaction.response.send_message("❌ Usuário não encontrado no servidor.", ephemeral=True)
+            return
+        try:
+            await member.add_roles(role, reason=f"Sensi aprovada por {interaction.user}")
+        except Exception as exc:
+            await interaction.response.send_message(f"❌ Não consegui dar o cargo: `{exc}`", ephemeral=True)
+            return
+        con = db()
+        try:
+            con.execute("UPDATE sensi_requests SET status='approved',reviewed_by=?,updated_at=? WHERE id=?", (interaction.user.id, lsx_now_iso(), row["id"]))
+            con.commit()
+        finally:
+            con.close()
+        e = interaction.message.embeds[0]
+        e.color = 0x2ECC71
+        e.add_field(name="Status", value=f"✅ Aprovado por {interaction.user.mention}", inline=False)
+        await interaction.response.edit_message(embed=e, view=None)
+        try:
+            await member.send(f"✅ Seu acesso ao **Gerador de Sensi Lock Sensi** foi aprovado em **{interaction.guild.name}**.")
+        except Exception:
+            pass
+
+    @discord.ui.button(label="❌ Recusar", style=discord.ButtonStyle.danger, custom_id="ls_sensi_reject_v1")
+    async def reject(self, interaction, button):
+        row = await self.get_request(interaction)
+        if not row:
+            return
+        con = db()
+        try:
+            con.execute("UPDATE sensi_requests SET status='rejected',reviewed_by=?,updated_at=? WHERE id=?", (interaction.user.id, lsx_now_iso(), row["id"]))
+            con.commit()
+        finally:
+            con.close()
+        e = interaction.message.embeds[0]
+        e.color = 0xE74C3C
+        e.add_field(name="Status", value=f"❌ Recusado por {interaction.user.mention}", inline=False)
+        await interaction.response.edit_message(embed=e, view=None)
+
+
+class LSXGenerateButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="🎯 Gerar Sensi", style=discord.ButtonStyle.success, custom_id="ls_sensi_generate_v1")
+
+    async def callback(self, interaction):
+        if not await lsx_has_access(interaction):
+            return
+        await interaction.response.send_message("Escolha a plataforma:", view=LSXPlatformView(), ephemeral=True)
+
+
+class LSXValidateButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="✅ Validar Acesso", style=discord.ButtonStyle.primary, custom_id="ls_sensi_validate_v1")
+
+    async def callback(self, interaction):
+        if await lsx_has_access(interaction, notify=False):
+            await interaction.response.send_message("✅ Você já possui acesso ao gerador.", ephemeral=True)
+            return
+        await interaction.response.send_modal(LSXProofModal())
+
+
+class LSXSensiPanel(discord.ui.LayoutView):
+    def __init__(self, guild_id=None):
+        super().__init__(timeout=None)
+        cfg = lsx_get_cfg(guild_id) if guild_id else None
+        banner = str(cfg["banner_url"] or "") if cfg else LSX_SENSI_BANNER
+        platform = lsx_platform_label(cfg["verification_platform"] if cfg else "tiktok")
+        url = str(cfg["verification_url"] or "") if cfg else ""
+        c = discord.ui.Container(accent_color=LSX_BLACK)
+        if lsx_valid_url(banner):
+            g = discord.ui.MediaGallery()
+            g.add_item(media=banner, description="Gerador de Sensi Lock Sensi")
+            c.add_item(g)
+            c.add_item(discord.ui.Separator(visible=True))
+        c.add_item(discord.ui.TextDisplay("## GERADOR DE SENSI LOCK SENSI"))
+        c.add_item(discord.ui.Separator(visible=True))
+        c.add_item(discord.ui.TextDisplay("Gere uma configuração personalizada para **Android, iOS ou Emulador**.\n\nInforme seu dispositivo/setup e receba uma base pronta para testar.\n**Acesso exclusivo para membros liberados pela Lock Sensi.**"))
+        c.add_item(discord.ui.Separator(visible=True))
+        c.add_item(discord.ui.TextDisplay(f"**🔓 Como liberar:** siga a Lock Sensi no **{platform}** e envie sua comprovação."))
+        c.add_item(discord.ui.Separator(visible=True))
+        c.add_item(discord.ui.TextDisplay("-# Lock Sensi • Sensibilidade personalizada para teste"))
+        self.add_item(c)
+        buttons = [LSXGenerateButton()]
+        if lsx_valid_url(url):
+            buttons.append(discord.ui.Button(label=f"🔗 Abrir {platform}", style=discord.ButtonStyle.link, url=url))
+        buttons.append(LSXValidateButton())
+        self.add_item(discord.ui.ActionRow(*buttons))
+
+
+async def setup_locksensi_integrated(bot, admin_check):
+    global LSX_BOT, LSX_ADMIN_CHECK
+    LSX_BOT = bot
+    LSX_ADMIN_CHECK = admin_check
+    lsx_ensure_schema()
+
+    bot.add_view(LSXPremiumTicketPanel())
+    bot.add_view(LSXTicketControls())
+    bot.add_view(LSXSensiPanel())
+    bot.add_view(LSXApprovalView())
+
+    # Substitui os comandos antigos de ticket pelo painel premium.
+    for _ticket_command in ("painel-ticket", "criar-tickets-modo-canais", "criar-tickets-modo-topico"):
+        try:
+            bot.tree.remove_command(_ticket_command)
+        except Exception:
+            pass
+
+    @bot.tree.command(name="painel-ticket", description="Publica o painel premium de atendimento Lock Sensi")
+    @app_commands.describe(imagem="URL do banner", titulo="Título opcional", descricao="Descrição opcional")
+    async def painel_ticket(interaction: discord.Interaction, imagem: Optional[str]=None, titulo: Optional[str]=None, descricao: Optional[str]=None):
+        if not await LSX_ADMIN_CHECK(interaction):
+            return
+        await interaction.channel.send(view=LSXPremiumTicketPanel(titulo or "PAINEL DE ATENDIMENTO LOCK SENSI", descricao or LSX_TICKET_DESC, imagem))
+        await interaction.response.send_message("✅ Painel premium publicado.", ephemeral=True)
+
+    @bot.tree.command(name="criar-tickets-modo-canais", description="Publica o painel premium de ticket")
+    async def criar_tickets_modo_canais_premium(interaction: discord.Interaction):
+        if not await LSX_ADMIN_CHECK(interaction):
+            return
+        await interaction.channel.send(view=LSXPremiumTicketPanel())
+        await interaction.response.send_message("✅ Painel premium publicado.", ephemeral=True)
+
+    @bot.tree.command(name="criar-tickets-modo-topico", description="Publica o painel premium de ticket")
+    async def criar_tickets_modo_topico_premium(interaction: discord.Interaction):
+        if not await LSX_ADMIN_CHECK(interaction):
+            return
+        await interaction.channel.send(view=LSXPremiumTicketPanel())
+        await interaction.response.send_message("✅ Painel premium publicado.", ephemeral=True)
+
+    for name in ("sensi-config", "publicar-sensi", "gerar-sensi", "listar-paineis"):
+        try:
+            bot.tree.remove_command(name)
+        except Exception:
+            pass
+
+    @bot.tree.command(name="sensi-config", description="Configura o painel e a validação do Gerador de Sensi")
+    @app_commands.describe(plataforma="Rede exigida", link="Link oficial", cargo="Cargo liberado", canal_validacao="Canal privado da staff", banner="URL do banner", cooldown="0 = ilimitado")
+    @app_commands.choices(plataforma=[
+        app_commands.Choice(name="TikTok", value="tiktok"),
+        app_commands.Choice(name="Instagram", value="instagram"),
+        app_commands.Choice(name="Discord", value="discord"),
+    ])
+    async def sensi_config(interaction: discord.Interaction, plataforma: app_commands.Choice[str], link: Optional[str]=None, cargo: Optional[discord.Role]=None, canal_validacao: Optional[discord.TextChannel]=None, banner: Optional[str]=None, cooldown: int=0):
+        if not await LSX_ADMIN_CHECK(interaction):
+            return
+        old = lsx_get_cfg(interaction.guild.id)
+        if cargo is None and old and old["access_role_id"]:
+            cargo = interaction.guild.get_role(int(old["access_role_id"]))
+        if cargo is None:
+            cargo = discord.utils.get(interaction.guild.roles, name="Sensi Liberada") or await interaction.guild.create_role(name="Sensi Liberada", reason="Acesso ao Gerador Lock Sensi")
+        if canal_validacao is None and old and old["proof_channel_id"]:
+            canal_validacao = interaction.guild.get_channel(int(old["proof_channel_id"]))
+        canal_validacao = canal_validacao or interaction.channel
+        if link is None and old:
+            link = old["verification_url"] or ""
+        if banner is None and old:
+            banner = old["banner_url"] or ""
+        lsx_save_cfg(interaction.guild.id, cargo.id, canal_validacao.id, plataforma.value, link, banner, cooldown)
+        await interaction.response.send_message(
+            f"✅ **Sensi Config atualizado**\nRede: **{lsx_platform_label(plataforma.value)}**\nCargo: {cargo.mention}\nCanal de aprovação: {canal_validacao.mention}\nGerações: **{'ilimitadas' if cooldown <= 0 else f'1 a cada {cooldown}s'}**\n\nA validação usa comprovante + aprovação da staff; o cargo é entregue automaticamente após aprovar.",
+            ephemeral=True,
+        )
+
+    @bot.tree.command(name="publicar-sensi", description="Publica o painel premium do Gerador de Sensi")
+    async def publicar_sensi(interaction: discord.Interaction, canal: Optional[discord.TextChannel]=None):
+        if not await LSX_ADMIN_CHECK(interaction):
+            return
+        if not lsx_get_cfg(interaction.guild.id):
+            await interaction.response.send_message("❌ Primeiro use `/sensi-config`.", ephemeral=True)
+            return
+        target = canal or interaction.channel
+        await target.send(view=LSXSensiPanel(interaction.guild.id))
+        await interaction.response.send_message(f"✅ Painel publicado em {target.mention}.", ephemeral=True)
+
+    @bot.tree.command(
+        name="listar-paineis",
+        description="Lista os painéis de vendas deste servidor com seus IDs",
+    )
+    async def listar_paineis(interaction: discord.Interaction):
+        if not await LSX_ADMIN_CHECK(interaction):
+            return
+
+        con = db()
+        try:
+            paineis = con.execute(
+                """
+                SELECT id, name, title, channel_id, message_id, display_mode
+                FROM panels
+                WHERE guild_id=?
+                ORDER BY id ASC
+                """,
+                (int(interaction.guild.id),),
+            ).fetchall()
+        finally:
+            con.close()
+
+        if not paineis:
+            await interaction.response.send_message(
+                "📭 Nenhum painel de vendas foi encontrado neste servidor.",
+                ephemeral=True,
+            )
+            return
+
+        linhas = []
+        for p in paineis:
+            painel_id = int(p["id"])
+            nome = str(p["name"] or p["title"] or f"Painel {painel_id}")
+            titulo = str(p["title"] or "").strip()
+            canal_id = p["channel_id"]
+            modo = str(p["display_mode"] or "lista")
+
+            canal_txt = f"<#{int(canal_id)}>" if canal_id else "sem canal salvo"
+
+            extra = ""
+            if titulo and titulo.lower() != nome.lower():
+                extra = f" • **{titulo[:70]}**"
+
+            linhas.append(
+                f"**#{painel_id}** — {nome[:80]}{extra}\n"
+                f"-# Canal: {canal_txt} • modo: {modo}"
+            )
+
+        # Divide para nunca estourar o limite do Discord.
+        blocos = []
+        atual = ""
+        for linha in linhas:
+            candidato = f"{atual}\n\n{linha}".strip()
+            if len(candidato) > 3500:
+                blocos.append(atual)
+                atual = linha
+            else:
+                atual = candidato
+        if atual:
+            blocos.append(atual)
+
+        await interaction.response.defer(ephemeral=True)
+
+        total = len(paineis)
+        for i, bloco in enumerate(blocos, start=1):
+            embed = discord.Embed(
+                title="📋 PAINÉIS LOCK SENSI",
+                description=bloco,
+                color=LSX_BLACK,
+            )
+            embed.set_footer(
+                text=f"{total} painel(is) • Página {i}/{len(blocos)}"
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @bot.tree.command(name="gerar-sensi", description="Gera uma sensibilidade personalizada Lock Sensi")
+    async def gerar_sensi(interaction: discord.Interaction):
+        if not await lsx_has_access(interaction):
+            return
+        await interaction.response.send_message("🎯 Escolha sua plataforma:", view=LSXPlatformView(), ephemeral=True)
 
 
 # Registra todas as rotas Flask antes de iniciar o servidor web.
