@@ -152,11 +152,12 @@ def is_owner_user(user_id: int):
 
 def get_subscription(guild_id: int):
     con = db()
-    row = con.execute(
-        "SELECT * FROM guild_subscriptions WHERE guild_id=?", (guild_id,)
-    ).fetchone()
-    con.close()
-    return row
+    try:
+        return con.execute(
+            "SELECT * FROM guild_subscriptions WHERE guild_id=?", (guild_id,)
+        ).fetchone()
+    finally:
+        con.close()
 
 
 def guild_has_plan(guild_id: int):
@@ -210,9 +211,28 @@ async def require_active_plan(inter):
         return True
     if is_owner_user(inter.user.id):
         return True
-    if guild_has_plan(inter.guild.id):
+    try:
+        # Consultas psycopg são síncronas: uma demora não pode travar todos os
+        # botões do Discord nem consumir os três segundos da interação.
+        active = await asyncio.wait_for(
+            asyncio.to_thread(guild_has_plan, inter.guild.id), timeout=1.8
+        )
+    except Exception as exc:
+        print(
+            f"[PLANO] consulta falhou servidor={inter.guild.id}: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        await smart_send(
+            inter,
+            "⚠️ Não consegui consultar o plano agora. Tente novamente em instantes.",
+            ephemeral=True,
+        )
+        return False
+    if active:
         return True
-    await inter.response.send_message(
+    await smart_send(
+        inter,
         f"🔒 Este servidor ainda não tem plano ativo.\n\nID do servidor: `{inter.guild.id}`\nPeça ao dono do bot para ativar com `/ativar-servidor`.",
         ephemeral=True,
     )
@@ -240,7 +260,8 @@ def is_admin(inter: discord.Interaction):
 
 async def admin_only(inter):
     if not is_admin(inter):
-        await inter.response.send_message(
+        await smart_send(
+            inter,
             "❌ Apenas administradores podem usar isso.", ephemeral=True
         )
         return False
@@ -340,9 +361,11 @@ class BuyView(discord.ui.View):
 
 
 class PanelOnlyView(discord.ui.View):
-    def __init__(self, panel_id: int, restore_only: bool = False):
+    def __init__(self, panel_id: int, restore_only: bool = False, product_rows=None):
         super().__init__(timeout=None)
-        self.add_item(PanelSelect(panel_id, restore_only=restore_only))
+        self.add_item(
+            PanelSelect(panel_id, restore_only=restore_only, product_rows=product_rows)
+        )
 
 
 class PanelOptionsRestoreView(discord.ui.View):
@@ -381,11 +404,13 @@ class PanelOptionsButton(discord.ui.Button):
         # e, em hospedagens como Render, pode levar mais de 3 segundos.
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            # PanelSelect abre uma conexão síncrona. Execute fora do loop do
-            # Discord para que um pooler lento não congele todos os botões.
-            view = await asyncio.wait_for(
-                asyncio.to_thread(PanelOnlyView, self.panel_id), timeout=12
+            # Só a consulta pode rodar na thread. Views criadas fora do loop
+            # do Discord não recebem os cliques no menu de seleção.
+            rows = await asyncio.wait_for(
+                asyncio.to_thread(PanelSelect.load_products, self.panel_id),
+                timeout=12,
             )
+            view = PanelOnlyView(self.panel_id, product_rows=rows)
             await interaction.followup.send(
                 "**Selecione um Produto**",
                 view=view,
@@ -551,7 +576,45 @@ def parse_panel_color(value: str) -> tuple[int, str]:
 
 
 class PanelSelect(discord.ui.Select):
-    def __init__(self, panel_id: int, restore_only: bool = False):
+    @staticmethod
+    def load_products(panel_id: int):
+        con = db()
+        try:
+            # Produtos usados como variantes são escolhidos dentro do carrinho.
+            try:
+                return con.execute(
+                    """
+                    SELECT p.*
+                    FROM products p
+                    JOIN panel_products pp ON p.id=pp.product_id
+                    WHERE pp.panel_id=?
+                      AND p.active=1
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM checkout_variants cv
+                          WHERE cv.variant_product_id=p.id
+                            AND cv.guild_id=p.guild_id
+                      )
+                    ORDER BY p.price ASC
+                    """,
+                    (panel_id,),
+                ).fetchall()
+            except Exception as exc:
+                print(f"[MENU PRODUTOS] fallback sem variantes: {exc}")
+                return con.execute(
+                    """
+                    SELECT p.*
+                    FROM products p
+                    JOIN panel_products pp ON p.id=pp.product_id
+                    WHERE pp.panel_id=? AND p.active=1
+                    ORDER BY p.price ASC
+                    """,
+                    (panel_id,),
+                ).fetchall()
+        finally:
+            con.close()
+
+    def __init__(self, panel_id: int, restore_only: bool = False, product_rows=None):
         self.panel_id = panel_id
         options = []
         if restore_only:
@@ -559,41 +622,7 @@ class PanelSelect(discord.ui.Select):
             # Para restaurar o callback basta registrar seu custom_id.
             options = [discord.SelectOption(label="Carregando produtos", value="none")]
         else:
-            con = db()
-            try:
-                # As mensagens antigas reutilizam esta mesma seleção.
-                try:
-                    rows = con.execute(
-                        """
-                        SELECT p.*
-                        FROM products p
-                        JOIN panel_products pp ON p.id=pp.product_id
-                        WHERE pp.panel_id=?
-                          AND p.active=1
-                          AND NOT EXISTS (
-                              SELECT 1
-                              FROM checkout_variants cv
-                              WHERE cv.variant_product_id=p.id
-                                AND cv.guild_id=p.guild_id
-                          )
-                        ORDER BY p.price ASC
-                        """,
-                        (panel_id,),
-                    ).fetchall()
-                except Exception as exc:
-                    print(f"[MENU PRODUTOS] fallback sem variantes: {exc}")
-                    rows = con.execute(
-                        """
-                        SELECT p.*
-                        FROM products p
-                        JOIN panel_products pp ON p.id=pp.product_id
-                        WHERE pp.panel_id=? AND p.active=1
-                        ORDER BY p.price ASC
-                        """,
-                        (panel_id,),
-                    ).fetchall()
-            finally:
-                con.close()
+            rows = product_rows if product_rows is not None else self.load_products(panel_id)
             for p in rows[:25]:
                 stock = "∞" if p["stock"] < 0 else str(p["stock"])
                 options.append(
@@ -1481,10 +1510,10 @@ async def listar_servidores(interaction: discord.Interaction):
     description="Remove comandos antigos e sincroniza os comandos atuais",
 )
 async def sincronizar(interaction: discord.Interaction):
+    # A consulta ao plano pode atrasar; confirme o comando antes de verificá-la.
+    await interaction.response.defer(ephemeral=True, thinking=True)
     if not await protected_admin_only(interaction):
         return
-
-    await interaction.response.defer(ephemeral=True, thinking=True)
 
     try:
         guild_obj = discord.Object(id=interaction.guild.id)
