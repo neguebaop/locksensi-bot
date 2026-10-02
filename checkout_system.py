@@ -2059,7 +2059,9 @@ async def api(method, endpoint, payload=None, guild_id=None, credentials=None):
     if credentials is not None:
         client_id, client_secret = credentials
     elif guild_id is not None:
-        client_id, client_secret, _source = get_mistic_credentials(guild_id)
+        client_id, client_secret, _source = await _checkout_db_call(
+            get_mistic_credentials, guild_id
+        )
     else:
         client_id, client_secret = CI, CS
 
@@ -2154,7 +2156,7 @@ def mistic_supports_internal_payout(guild_id):
 
 
 async def create_internal_payout(guild_id, email, amount, description):
-    if not mistic_supports_internal_payout(guild_id):
+    if not await _checkout_db_call(mistic_supports_internal_payout, guild_id):
         raise RuntimeError(
             "O split de 3 pessoas exige uma Chave de Acesso MisticPay pk_/sk_ "
             "com permissão cashout. Credenciais ci_/cs_ só suportam o split nativo de 2 contas."
@@ -3401,7 +3403,7 @@ class VerifyView(discord.ui.View):
 
 async def process_subowner_payout(oid):
     """Faz o terceiro repasse uma única vez, com claim atômico no banco."""
-    order = get_order(oid)
+    order = await _checkout_db_call(get_order, oid)
     if not order or str(order["status"]) != "aprovado":
         return False, "pedido ainda não aprovado"
     if int(_row_value(order, "is_test", 0) or 0) == 1:
@@ -3417,25 +3419,29 @@ async def process_subowner_payout(oid):
     if status == "paid":
         return True, "terceiro repasse já realizado"
 
-    con = db()
-    try:
-        claimed = con.execute(
-            """
-            UPDATE orders
-            SET subowner_payout_status='processing',
-                subowner_payout_attempts=COALESCE(subowner_payout_attempts,0)+1,
-                subowner_payout_error=NULL,
-                updated_at=?
-            WHERE id=?
-              AND subowner_payout_status IN ('pending','failed')
-              AND COALESCE(subowner_payout_attempts,0)<5
-            RETURNING *
-            """,
-            (now_iso(), int(oid)),
-        ).fetchone()
-        con.commit()
-    finally:
-        con.close()
+    def claim_payout():
+        con = db()
+        try:
+            claimed = con.execute(
+                """
+                UPDATE orders
+                SET subowner_payout_status='processing',
+                    subowner_payout_attempts=COALESCE(subowner_payout_attempts,0)+1,
+                    subowner_payout_error=NULL,
+                    updated_at=?
+                WHERE id=?
+                  AND subowner_payout_status IN ('pending','failed')
+                  AND COALESCE(subowner_payout_attempts,0)<5
+                RETURNING *
+                """,
+                (now_iso(), int(oid)),
+            ).fetchone()
+            con.commit()
+            return claimed
+        finally:
+            con.close()
+
+    claimed = await asyncio.to_thread(claim_payout)
     if not claimed:
         return False, "repasse já está sendo processado ou excedeu as tentativas"
 
@@ -3450,20 +3456,24 @@ async def process_subowner_payout(oid):
         payout_id = str(
             data.get("transactionId") or data.get("jobId") or data.get("id") or ""
         )
-        con = db()
-        try:
-            con.execute(
-                """
-                UPDATE orders
-                SET subowner_payout_status='paid',subowner_payout_id=?,
-                    subowner_payout_error=NULL,subowner_paid_at=?,updated_at=?
-                WHERE id=? AND subowner_payout_status='processing'
-                """,
-                (payout_id, now_iso(), now_iso(), int(oid)),
-            )
-            con.commit()
-        finally:
-            con.close()
+
+        def mark_paid():
+            con = db()
+            try:
+                con.execute(
+                    """
+                    UPDATE orders
+                    SET subowner_payout_status='paid',subowner_payout_id=?,
+                        subowner_payout_error=NULL,subowner_paid_at=?,updated_at=?
+                    WHERE id=? AND subowner_payout_status='processing'
+                    """,
+                    (payout_id, now_iso(), now_iso(), int(oid)),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+        await asyncio.to_thread(mark_paid)
         print(
             f"[AFILIADO] pedido=#{oid} terceiro_repasse=paid "
             f"destino={mask_split_email(email)} valor={money(amount)} id={payout_id or '-'}",
@@ -3472,25 +3482,54 @@ async def process_subowner_payout(oid):
         return True, "terceiro repasse realizado"
     except Exception as exc:
         error = str(exc)[:800]
-        con = db()
-        try:
-            con.execute(
-                """
-                UPDATE orders
-                SET subowner_payout_status='failed',subowner_payout_error=?,updated_at=?
-                WHERE id=? AND subowner_payout_status='processing'
-                """,
-                (error, now_iso(), int(oid)),
-            )
-            con.commit()
-        finally:
-            con.close()
+
+        def mark_failed():
+            con = db()
+            try:
+                con.execute(
+                    """
+                    UPDATE orders
+                    SET subowner_payout_status='failed',subowner_payout_error=?,updated_at=?
+                    WHERE id=? AND subowner_payout_status='processing'
+                    """,
+                    (error, now_iso(), int(oid)),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+        await asyncio.to_thread(mark_failed)
         print(f"[AFILIADO] pedido=#{oid} terceiro_repasse=failed erro={error}", flush=True)
         return False, error
 
 
+def _mark_order_approved(oid, force):
+    """Mantém SELECT FOR UPDATE e atualização no mesmo worker/transação."""
+    con = db()
+    try:
+        cur = con.cursor()
+        current = cur.execute(
+            "SELECT * FROM orders WHERE id=? FOR UPDATE", (oid,)
+        ).fetchone()
+        if not current or current["status"] == "aprovado":
+            return False
+        cur.execute(
+            "UPDATE orders SET status='aprovado',paid_at=?,updated_at=?,is_test=? WHERE id=?",
+            (now_iso(), now_iso(), 1 if force else current["is_test"], oid),
+        )
+        if not force:
+            cur.execute(
+                "UPDATE products SET stock=CASE WHEN stock>0 THEN stock-1 ELSE stock END WHERE id=?",
+                (current["product_id"],),
+            )
+        con.commit()
+        return True
+    finally:
+        con.close()
+
+
 async def verify(oid, force=False):
-    o = get_order(oid)
+    o = await _checkout_db_call(get_order, oid)
     if not o:
         return False, "Pedido não encontrado."
     if o["status"] == "aprovado":
@@ -3508,25 +3547,8 @@ async def verify(oid, force=False):
             return False, f"❌ Erro ao consultar: `{str(ex)[:220]}`"
     if state != "COMPLETO":
         return False, f"🟡 Ainda aguardando. Status: **{state or 'PENDENTE'}**."
-    con = db()
-    cur = con.cursor()
-    current = cur.execute(
-        "SELECT * FROM orders WHERE id=? FOR UPDATE", (oid,)
-    ).fetchone()
-    if current["status"] == "aprovado":
-        con.close()
+    if not await asyncio.to_thread(_mark_order_approved, oid, force):
         return True, "✅ Já processado."
-    cur.execute(
-        "UPDATE orders SET status='aprovado',paid_at=?,updated_at=?,is_test=? WHERE id=?",
-        (now_iso(), now_iso(), 1 if force else current["is_test"], oid),
-    )
-    if not force:
-        cur.execute(
-            "UPDATE products SET stock=CASE WHEN stock>0 THEN stock-1 ELSE stock END WHERE id=?",
-            (current["product_id"],),
-        )
-    con.commit()
-    con.close()
     if not force:
         await process_subowner_payout(oid)
     await deliver(oid)
@@ -4075,7 +4097,15 @@ class HwidResetActionView(discord.ui.View):
         self.add_item(button)
 
     async def open_modal(self, i):
-        request = get_hwid_reset_request(self.request_id)
+        try:
+            # Modal precisa ser a primeira resposta ao Discord (até 3s).
+            request = await asyncio.wait_for(
+                asyncio.to_thread(get_hwid_reset_request, self.request_id), timeout=2
+            )
+        except Exception as exc:
+            print(f"[HWID] leitura do reset: {type(exc).__name__}")
+            await i.response.send_message("⚠️ Banco ocupado. Tente novamente em instantes.", ephemeral=True)
+            return
         if not request or int(request["user_id"]) != int(i.user.id):
             await i.response.send_message(
                 "❌ Este reset não pertence à sua conta.", ephemeral=True
@@ -4101,7 +4131,12 @@ class HwidResetBuyView(discord.ui.View):
 
     async def buy(self, i):
         await i.response.defer(ephemeral=True, thinking=True)
-        product = get_product(self.product_id)
+        try:
+            product = await _checkout_db_call(get_product, self.product_id)
+        except Exception as exc:
+            print(f"[HWID] produto indisponível: {type(exc).__name__}")
+            await i.followup.send("⚠️ Banco ocupado. Tente novamente em instantes.", ephemeral=True)
+            return
         if not product or not is_hwid_reset_product(product):
             await i.followup.send("❌ Este produto de reset não está disponível.", ephemeral=True)
             return
@@ -4146,9 +4181,26 @@ class SaleView(discord.ui.View):
             )
 
 
+def _delivery_data(oid):
+    order = get_order(oid)
+    if not order:
+        return None, None
+    return order, get_product(order["product_id"])
+
+
+def _mark_delivery(oid, delivered):
+    con = db()
+    try:
+        con.execute("UPDATE orders SET delivered=? WHERE id=?", (1 if delivered else 0, oid))
+        con.commit()
+    finally:
+        con.close()
+
+
 async def deliver(oid):
-    o = get_order(oid)
-    p = get_product(o["product_id"])
+    o, p = await _checkout_db_call(_delivery_data, oid)
+    if not o or not p:
+        return
     guild = BOT.get_guild(o["guild_id"])
     member = guild.get_member(o["user_id"]) if guild else None
     if guild and not member:
@@ -4170,7 +4222,10 @@ async def deliver(oid):
 
     benefits = get_product_benefits(p)
     is_reset_purchase = is_hwid_reset_product(p)
-    reset_request = get_or_create_hwid_reset_request(o) if is_reset_purchase else None
+    reset_request = (
+        await asyncio.to_thread(get_or_create_hwid_reset_request, o)
+        if is_reset_purchase else None
+    )
 
     # A key não é criada aqui.
     # O cliente cria a própria key pelo painel "Criar sua Key" depois
@@ -4222,7 +4277,11 @@ async def deliver(oid):
             sent = True
         except Exception:
             pass
-    cfg = get_cfg(o["guild_id"])
+    try:
+        cfg = await _checkout_db_call(get_cfg, o["guild_id"])
+    except Exception as exc:
+        print(f"[ENTREGA] canal de logs indisponível pedido={oid}: {type(exc).__name__}")
+        cfg = None
     ch = None
     if guild and cfg:
         # Primeiro tenta os IDs salvos no banco.
@@ -4260,13 +4319,18 @@ async def deliver(oid):
             # Salva o novo ID para as próximas vendas.
             if ch is not None:
                 try:
-                    con = db()
-                    con.execute(
-                        "UPDATE guild_config SET log_channel_id=? WHERE guild_id=?",
-                        (ch.id, o["guild_id"]),
-                    )
-                    con.commit()
-                    con.close()
+                    def save_log_channel():
+                        con = db()
+                        try:
+                            con.execute(
+                                "UPDATE guild_config SET log_channel_id=? WHERE guild_id=?",
+                                (ch.id, o["guild_id"]),
+                            )
+                            con.commit()
+                        finally:
+                            con.close()
+
+                    await asyncio.to_thread(save_log_channel)
                     print(
                         f"Canal de logs atualizado automaticamente para #{ch.name} ({ch.id})."
                     )
@@ -4275,11 +4339,12 @@ async def deliver(oid):
 
     if ch and member:
         try:
+            sale_view = await asyncio.to_thread(SaleView, o["guild_id"])
             await ch.send(
                 file=discord.File(
                     await sale_card(member, o), filename=f"venda-{oid}.png"
                 ),
-                view=SaleView(o["guild_id"]),
+                view=sale_view,
             )
             if _row_value(o, "affiliate_id"):
                 affiliate_log = discord.Embed(
@@ -4309,10 +4374,7 @@ async def deliver(oid):
             f"Canal de logs da venda #{oid} não encontrado. "
             f"Confira log_channel_id/purchase_channel_id/sales_channel_id."
         )
-    con = db()
-    con.execute("UPDATE orders SET delivered=? WHERE id=?", (1 if sent else 0, oid))
-    con.commit()
-    con.close()
+    await asyncio.to_thread(_mark_delivery, oid, sent)
     if guild and o["cart_channel_id"]:
         cc = guild.get_channel(o["cart_channel_id"])
         if cc:
@@ -4330,8 +4392,8 @@ async def deliver(oid):
                     "✅ Pagamento aprovado. A entrega foi enviada no seu privado. Este carrinho fechará em 20 segundos."
                 )
                 await asyncio.sleep(20)
-                clear_cart_coupon(cc.id)
-                clear_cart_affiliate(cc.id)
+                await asyncio.to_thread(clear_cart_coupon, cc.id)
+                await asyncio.to_thread(clear_cart_affiliate, cc.id)
                 await cc.delete()
             except:
                 pass
@@ -4341,39 +4403,14 @@ async def watcher():
     await BOT.wait_until_ready()
     while not BOT.is_closed():
         try:
-            con = db()
-            rows = con.execute(
-                "SELECT id FROM orders WHERE status='pendente' AND transaction_id!='' ORDER BY id DESC LIMIT 30"
-            ).fetchall()
-            con.close()
+            rows = await _checkout_db_call(_watcher_pending_orders)
             for r in rows:
                 await verify(r["id"])
                 await asyncio.sleep(1.05)
 
             # Se o processo reiniciar no meio de um repasse, libera o claim
             # antigo e tenta novamente. Cada pedido tem no máximo 5 tentativas.
-            con = db()
-            con.execute(
-                """
-                UPDATE orders
-                SET subowner_payout_status='failed',
-                    subowner_payout_error='Processamento interrompido; nova tentativa agendada'
-                WHERE subowner_payout_status='processing'
-                  AND updated_at < NOW() - INTERVAL '10 minutes'
-                """
-            )
-            payout_rows = con.execute(
-                """
-                SELECT id FROM orders
-                WHERE status='aprovado'
-                  AND subowner_payout_status IN ('pending','failed')
-                  AND COALESCE(subowner_payout_attempts,0)<5
-                ORDER BY id ASC
-                LIMIT 20
-                """
-            ).fetchall()
-            con.commit()
-            con.close()
+            payout_rows = await _checkout_db_call(_watcher_pending_payouts)
             for r in payout_rows:
                 await process_subowner_payout(r["id"])
                 await asyncio.sleep(1.05)
@@ -7710,34 +7747,88 @@ class CouponCommands(app_commands.Group):
         )
 
 
+def _watcher_pending_orders():
+    con = db()
+    try:
+        return con.execute(
+            "SELECT id FROM orders WHERE status='pendente' AND transaction_id!='' ORDER BY id DESC LIMIT 30"
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def _watcher_pending_payouts():
+    con = db()
+    try:
+        con.execute(
+            """
+            UPDATE orders
+            SET subowner_payout_status='failed',
+                subowner_payout_error='Processamento interrompido; nova tentativa agendada'
+            WHERE subowner_payout_status='processing'
+              AND updated_at < NOW() - INTERVAL '10 minutes'
+            """
+        )
+        rows = con.execute(
+            """
+            SELECT id FROM orders
+            WHERE status='aprovado'
+              AND subowner_payout_status IN ('pending','failed')
+              AND COALESCE(subowner_payout_attempts,0)<5
+            ORDER BY id ASC LIMIT 20
+            """
+        ).fetchall()
+        con.commit()
+        return rows
+    finally:
+        con.close()
+
+
+def _hwid_persistent_ids():
+    init_db()
+    con = db()
+    try:
+        return (
+            con.execute(
+                "SELECT id FROM products WHERE active=1 AND COALESCE(is_hwid_reset,0)=1"
+            ).fetchall(),
+            con.execute(
+                "SELECT id FROM hwid_reset_requests WHERE status IN ('pending','processing')"
+            ).fetchall(),
+        )
+    finally:
+        con.close()
+
+
+async def _restore_hwid_views(bot):
+    while not bot.is_closed():
+        try:
+            reset_products, pending_resets = await asyncio.wait_for(
+                asyncio.to_thread(_hwid_persistent_ids), timeout=60
+            )
+            for row in reset_products:
+                bot.add_view(HwidResetBuyView(int(row["id"])))
+            for row in pending_resets:
+                bot.add_view(HwidResetActionView(int(row["id"])))
+            if not getattr(bot, "_mistic_watcher", False):
+                bot._mistic_watcher = True
+                asyncio.create_task(watcher())
+            print(f"[HWID] {len(reset_products)} produto(s), {len(pending_resets)} pedido(s) restaurados")
+            return
+        except Exception as exc:
+            print(f"[HWID] Banco indisponível ({type(exc).__name__}); nova tentativa em 30s")
+            await asyncio.sleep(30)
+
+
 async def setup(bot, admin_check=None):
     global BOT, ADMIN_CHECK
     BOT = bot
     ADMIN_CHECK = admin_check
-    init_db()
-
     # O botão "Gerar Key" continua respondendo mesmo após reiniciar o bot.
     try:
         bot.add_view(LicenseGenerateView())
     except Exception as exc:
         print(f"License persistent view: {exc}")
-    # Mantém os botões de compra e de uso do reset funcionando após restart.
-    try:
-        con = db()
-        reset_products = con.execute(
-            "SELECT id FROM products WHERE active=1 AND COALESCE(is_hwid_reset,0)=1"
-        ).fetchall()
-        pending_resets = con.execute(
-            "SELECT id FROM hwid_reset_requests WHERE status IN ('pending','processing')"
-        ).fetchall()
-        con.close()
-        for row in reset_products:
-            bot.add_view(HwidResetBuyView(int(row["id"])))
-        for row in pending_resets:
-            bot.add_view(HwidResetActionView(int(row["id"])))
-    except Exception as exc:
-        print(f"HWID reset persistent views: {exc}")
-
     for command_group in (
         CheckoutCommands(),
         CheckoutVariantCommands(),
@@ -7750,9 +7841,8 @@ async def setup(bot, admin_check=None):
             bot.tree.add_command(command_group)
         except app_commands.CommandAlreadyRegistered:
             pass
-    if not getattr(bot, "_mistic_watcher", False):
-        bot._mistic_watcher = True
-        asyncio.create_task(watcher())
+    if not getattr(bot, "_hwid_restore_task", None):
+        bot._hwid_restore_task = asyncio.create_task(_restore_hwid_views(bot))
 
 
 async def webhook_process(payload):
@@ -7764,8 +7854,13 @@ async def webhook_process(payload):
     )
     if not tid:
         return
-    con = db()
-    row = con.execute("SELECT id FROM orders WHERE transaction_id=?", (tid,)).fetchone()
-    con.close()
+    def find_order():
+        con = db()
+        try:
+            return con.execute("SELECT id FROM orders WHERE transaction_id=?", (tid,)).fetchone()
+        finally:
+            con.close()
+
+    row = await _checkout_db_call(find_order)
     if row:
         await verify(row["id"])

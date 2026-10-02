@@ -291,13 +291,32 @@ def register_routes(app):
     def oauth_status():
         return jsonify({'ok':oauth_ready(),'redirect_uri':oauth_redirect_uri() if PUBLIC_BASE_URL else ''})
 
+def _verification_view_ids():
+    init_db()
+    con = db()
+    try:
+        return [r['guild_id'] for r in con.execute('SELECT DISTINCT guild_id FROM verification_panels').fetchall()]
+    finally:
+        con.close()
+
+
+async def _restore_verification_views(bot):
+    while not bot.is_closed():
+        try:
+            gids = await asyncio.wait_for(asyncio.to_thread(_verification_view_ids), timeout=15)
+            for gid in gids:
+                bot.add_view(VerifyPanelView(gid))
+            return
+        except Exception as exc:
+            print(f'[VERIFICACAO] Banco indisponível ({type(exc).__name__}); nova tentativa em 30s')
+            await asyncio.sleep(30)
+
+
 async def setup(bot,app,admin_check=None):
     global BOT,APP,ADMIN_CHECK
-    BOT=bot; APP=app; ADMIN_CHECK=admin_check; init_db()
+    BOT=bot; APP=app; ADMIN_CHECK=admin_check
     try: bot.tree.add_command(VerificationCommands())
     except app_commands.CommandAlreadyRegistered: pass
     if not getattr(app,'_verification_routes',False): register_routes(app); app._verification_routes=True
-    con=db(); gids=[r['guild_id'] for r in con.execute('SELECT DISTINCT guild_id FROM verification_panels').fetchall()]; con.close()
-    for gid in gids:
-        try: bot.add_view(VerifyPanelView(gid))
-        except Exception: pass
+    if not getattr(bot, '_verification_restore_task', None):
+        bot._verification_restore_task = asyncio.create_task(_restore_verification_views(bot))

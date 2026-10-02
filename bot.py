@@ -107,9 +107,6 @@ def init_db():
     ensure_schema()
 
 
-init_db()
-
-
 def ensure_config(guild_id: int):
     con = db()
     try:
@@ -343,9 +340,17 @@ class BuyView(discord.ui.View):
 
 
 class PanelOnlyView(discord.ui.View):
+    def __init__(self, panel_id: int, restore_only: bool = False):
+        super().__init__(timeout=None)
+        self.add_item(PanelSelect(panel_id, restore_only=restore_only))
+
+
+class PanelOptionsRestoreView(discord.ui.View):
+    """Registra o botão antigo sem consultar o banco durante o on_ready."""
+
     def __init__(self, panel_id: int):
         super().__init__(timeout=None)
-        self.add_item(PanelSelect(panel_id))
+        self.add_item(PanelOptionsButton(panel_id))
 
 
 def get_panel_mode(panel_id: int) -> str:
@@ -546,58 +551,59 @@ def parse_panel_color(value: str) -> tuple[int, str]:
 
 
 class PanelSelect(discord.ui.Select):
-    def __init__(self, panel_id: int):
+    def __init__(self, panel_id: int, restore_only: bool = False):
         self.panel_id = panel_id
         options = []
-        con = db()
-        try:
-            # Mostra no menu SOMENTE os produtos principais.
-            # Produtos usados como variantes (ex.: Mensal/Permanente) continuam
-            # vinculados ao painel e ao banco, mas ficam escondidos desta lista.
+        if restore_only:
+            # O Discord envia o valor da mensagem publicada originalmente.
+            # Para restaurar o callback basta registrar seu custom_id.
+            options = [discord.SelectOption(label="Carregando produtos", value="none")]
+        else:
+            con = db()
             try:
-                rows = con.execute(
-                    """
-                    SELECT p.*
-                    FROM products p
-                    JOIN panel_products pp ON p.id=pp.product_id
-                    WHERE pp.panel_id=?
-                      AND p.active=1
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM checkout_variants cv
-                          WHERE cv.variant_product_id=p.id
-                            AND cv.guild_id=p.guild_id
-                      )
-                    ORDER BY p.price ASC
-                    """,
-                    (panel_id,),
-                ).fetchall()
-            except Exception as exc:
-                # Compatibilidade com instalações antigas antes da tabela
-                # checkout_variants existir.
-                print(f"[MENU PRODUTOS] fallback sem variantes: {exc}")
-                rows = con.execute(
-                    """
-                    SELECT p.*
-                    FROM products p
-                    JOIN panel_products pp ON p.id=pp.product_id
-                    WHERE pp.panel_id=? AND p.active=1
-                    ORDER BY p.price ASC
-                    """,
-                    (panel_id,),
-                ).fetchall()
-        finally:
-            con.close()
-        for p in rows[:25]:
-            stock = "∞" if p["stock"] < 0 else str(p["stock"])
-            options.append(
-                discord.SelectOption(
-                    label=p["name"][:100],
-                    description=f"{money(p['price'])} | Estoque: {stock}",
-                    emoji="🛒",
-                    value=str(p["id"]),
+                # As mensagens antigas reutilizam esta mesma seleção.
+                try:
+                    rows = con.execute(
+                        """
+                        SELECT p.*
+                        FROM products p
+                        JOIN panel_products pp ON p.id=pp.product_id
+                        WHERE pp.panel_id=?
+                          AND p.active=1
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM checkout_variants cv
+                              WHERE cv.variant_product_id=p.id
+                                AND cv.guild_id=p.guild_id
+                          )
+                        ORDER BY p.price ASC
+                        """,
+                        (panel_id,),
+                    ).fetchall()
+                except Exception as exc:
+                    print(f"[MENU PRODUTOS] fallback sem variantes: {exc}")
+                    rows = con.execute(
+                        """
+                        SELECT p.*
+                        FROM products p
+                        JOIN panel_products pp ON p.id=pp.product_id
+                        WHERE pp.panel_id=? AND p.active=1
+                        ORDER BY p.price ASC
+                        """,
+                        (panel_id,),
+                    ).fetchall()
+            finally:
+                con.close()
+            for p in rows[:25]:
+                stock = "∞" if p["stock"] < 0 else str(p["stock"])
+                options.append(
+                    discord.SelectOption(
+                        label=p["name"][:100],
+                        description=f"{money(p['price'])} | Estoque: {stock}",
+                        emoji="🛒",
+                        value=str(p["id"]),
+                    )
                 )
-            )
         if not options:
             options = [
                 discord.SelectOption(
@@ -1189,60 +1195,93 @@ async def criar_ticket(interaction: discord.Interaction, tipo: str):
 
 @bot.event
 async def on_guild_join(guild):
-    ensure_config(guild.id)
-    if DEFAULT_TRIAL_DAYS > 0:
-        expires = datetime.utcnow() + timedelta(days=DEFAULT_TRIAL_DAYS)
-        con = db()
-        con.execute(
-            """INSERT INTO guild_subscriptions(guild_id,active,plan_name,expires_at,activated_by,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET active=1, plan_name=excluded.plan_name, expires_at=excluded.expires_at, updated_at=excluded.updated_at""",
-            (guild.id, 1, "trial", expires.strftime("%Y-%m-%d %H:%M:%S"), 0, now_iso()),
-        )
-        con.commit()
-        con.close()
+    def configure_guild():
+        ensure_config(guild.id)
+        if DEFAULT_TRIAL_DAYS > 0:
+            expires = datetime.utcnow() + timedelta(days=DEFAULT_TRIAL_DAYS)
+            con = db()
+            try:
+                con.execute(
+                    """INSERT INTO guild_subscriptions(guild_id,active,plan_name,expires_at,activated_by,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET active=1, plan_name=excluded.plan_name, expires_at=excluded.expires_at, updated_at=excluded.updated_at""",
+                    (guild.id, 1, "trial", expires.strftime("%Y-%m-%d %H:%M:%S"), 0, now_iso()),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+    try:
+        await asyncio.to_thread(configure_guild)
+    except Exception as exc:
+        print(f"[CONFIG] servidor={guild.id}: {type(exc).__name__}")
 
 
 # ================= COMMANDS =================
+def _load_persistent_view_ids():
+    con = db()
+    try:
+        panels = con.execute("SELECT id, display_mode FROM panels").fetchall()
+        products = con.execute("SELECT id FROM products WHERE active=1").fetchall()
+        try:
+            rankings = con.execute("SELECT guild_id FROM ranking_config").fetchall()
+        except Exception as exc:
+            # A tabela opcional de ranking pode não existir em lojas antigas.
+            if getattr(exc, "sqlstate", None) != "42P01":
+                raise
+            rankings = []
+        return panels, products, rankings
+    finally:
+        con.close()
+
+
+async def restore_store_views():
+    """Restaurar painéis sem bloquear os heartbeats e demais botões."""
+    while not bot.is_closed():
+        try:
+            paineis, produtos, rankings = await asyncio.wait_for(
+                asyncio.to_thread(_load_persistent_view_ids), timeout=15
+            )
+            for painel in paineis:
+                try:
+                    pid = int(painel["id"])
+                    mode = str(painel["display_mode"] or "select").lower()
+                    view = (
+                        PanelOptionsRestoreView(pid)
+                        if mode == "button"
+                        else PanelOnlyView(pid, restore_only=True)
+                    )
+                    bot.add_view(view)
+                except Exception as exc:
+                    print(f"[VIEWS] painel={painel['id']}: {type(exc).__name__}")
+            for ranking in rankings:
+                bot.add_view(RankingView(int(ranking["guild_id"])))
+            for produto in produtos:
+                bot.add_view(BuyView(product_id=int(produto["id"])))
+            print(
+                f"Views persistentes restauradas: {len(paineis)} painel(is), "
+                f"{len(produtos)} produto(s) e {len(rankings)} ranking(s)"
+            )
+            for guild in bot.guilds:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(ensure_config, guild.id), timeout=12
+                    )
+                except Exception as exc:
+                    print(f"[CONFIG] servidor={guild.id}: {type(exc).__name__}")
+            return
+        except Exception as exc:
+            print(f"[VIEWS] Banco indisponível ({type(exc).__name__}); nova tentativa em 30s")
+            await asyncio.sleep(30)
+
+
 @bot.event
 async def on_ready():
-    init_db()
-
-    # Persistent views: mantém botões/dropdowns funcionando após reiniciar o bot.
-    # Isso restaura todos os painéis salvos no vendas.db.
+    # on_ready também acontece em reconexões. Não inicia tarefas duplicadas.
+    if getattr(bot, "_startup_done", False):
+        return
+    bot._startup_done = True
     bot.add_view(TicketPanelView())
     bot.add_view(CloseTicketView())
-    try:
-        con = db()
-        paineis = con.execute("SELECT * FROM panels").fetchall()
-        produtos = con.execute("SELECT * FROM products WHERE active=1").fetchall()
-        rankings = con.execute("SELECT guild_id FROM ranking_config").fetchall()
-        con.close()
-        for painel in paineis:
-            try:
-                bot.add_view(panel_view(int(painel["id"])))
-            except Exception as e:
-                print("erro restaurando painel", painel["id"], e)
-        for ranking in rankings:
-            try:
-                bot.add_view(RankingView(int(ranking["guild_id"])))
-            except Exception as e:
-                print("erro restaurando ranking", ranking["guild_id"], e)
-        for produto in produtos:
-            try:
-                bot.add_view(BuyView(product_id=int(produto["id"])))
-            except Exception as e:
-                print("erro restaurando produto", produto["id"], e)
-        # Os painéis antigos e produtos continuam persistentes pelas Views acima.
-        # As classes PremiumPanelView/PurchaseReceiptView pertenciam a uma versão
-        # anterior e foram removidas para evitar NameError na inicialização.
-        print(
-            f"Views persistentes restauradas: {len(paineis)} painel(is), "
-            f"{len(produtos)} produto(s) e {len(rankings)} ranking(s)"
-        )
-    except Exception as e:
-        print("Erro restaurando views persistentes:", e)
-
-    for g in bot.guilds:
-        ensure_config(g.id)
+    bot._store_restore_task = asyncio.create_task(restore_store_views())
     try:
         if not getattr(bot, "_checkout_setup_done", False):
             await checkout_system.setup(bot, protected_admin_only)
@@ -3372,7 +3411,17 @@ async def setup_locksensi_integrated(bot, admin_check):
     global LSX_BOT, LSX_ADMIN_CHECK
     LSX_BOT = bot
     LSX_ADMIN_CHECK = admin_check
-    lsx_ensure_schema()
+    # A criação das tabelas consulta o Supabase; nunca bloqueie o Discord.
+    async def init_sensi_background():
+        while not bot.is_closed():
+            try:
+                await asyncio.to_thread(lsx_ensure_schema)
+                return
+            except Exception as exc:
+                print(f"[SENSI] Banco indisponível ({type(exc).__name__}); nova tentativa em 30s")
+                await asyncio.sleep(30)
+
+    asyncio.create_task(init_sensi_background())
 
     bot.add_view(LSXPremiumTicketPanel())
     bot.add_view(LSXTicketControls())
