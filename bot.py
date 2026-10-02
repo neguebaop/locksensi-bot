@@ -112,23 +112,26 @@ init_db()
 
 def ensure_config(guild_id: int):
     con = db()
-    cur = con.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO guild_config(guild_id,pix_key,pix_name,pix_city,webhook_url) VALUES(?,?,?,?,?)",
-        (guild_id, PIX_KEY, PIX_NOME, PIX_CIDADE, WEBHOOK_URL),
-    )
-    con.commit()
-    con.close()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO guild_config(guild_id,pix_key,pix_name,pix_city,webhook_url) VALUES(?,?,?,?,?)",
+            (guild_id, PIX_KEY, PIX_NOME, PIX_CIDADE, WEBHOOK_URL),
+        )
+        con.commit()
+    finally:
+        con.close()
 
 
 def get_config(guild_id: int):
     ensure_config(guild_id)
     con = db()
-    row = con.execute(
-        "SELECT * FROM guild_config WHERE guild_id=?", (guild_id,)
-    ).fetchone()
-    con.close()
-    return row
+    try:
+        return con.execute(
+            "SELECT * FROM guild_config WHERE guild_id=?", (guild_id,)
+        ).fetchone()
+    finally:
+        con.close()
 
 
 def now_iso():
@@ -182,17 +185,18 @@ def plan_text(guild_id: int):
 def get_customization(guild_id: int):
     ensure_config(guild_id)
     con = db()
-    cur = con.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO guild_customization(guild_id,store_name,color) SELECT guild_id,store_name,color FROM guild_config WHERE guild_id=?",
-        (guild_id,),
-    )
-    con.commit()
-    row = cur.execute(
-        "SELECT * FROM guild_customization WHERE guild_id=?", (guild_id,)
-    ).fetchone()
-    con.close()
-    return row
+    try:
+        cur = con.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO guild_customization(guild_id,store_name,color) SELECT guild_id,store_name,color FROM guild_config WHERE guild_id=?",
+            (guild_id,),
+        )
+        con.commit()
+        return cur.execute(
+            "SELECT * FROM guild_customization WHERE guild_id=?", (guild_id,)
+        ).fetchone()
+    finally:
+        con.close()
 
 
 def parse_color(value, default=0x5865F2):
@@ -372,16 +376,20 @@ class PanelOptionsButton(discord.ui.Button):
         # e, em hospedagens como Render, pode levar mais de 3 segundos.
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            view = PanelOnlyView(self.panel_id)
+            # PanelSelect abre uma conexão síncrona. Execute fora do loop do
+            # Discord para que um pooler lento não congele todos os botões.
+            view = await asyncio.wait_for(
+                asyncio.to_thread(PanelOnlyView, self.panel_id), timeout=12
+            )
             await interaction.followup.send(
                 "**Selecione um Produto**",
                 view=view,
                 ephemeral=True,
             )
         except Exception as exc:
-            print(f"Erro ao abrir opções do painel {self.panel_id}: {exc}")
+            print(f"[MENU PRODUTOS] painel={self.panel_id}: {type(exc).__name__}")
             await interaction.followup.send(
-                "Não consegui carregar os produtos deste painel agora. Tente novamente em alguns segundos.",
+                "⚠️ O banco da loja está demorando. Tente abrir as opções novamente em instantes.",
                 ephemeral=True,
             )
 

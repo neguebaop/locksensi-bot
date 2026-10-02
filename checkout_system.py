@@ -1631,9 +1631,10 @@ def get_product_split(product):
 
 def get_product(pid):
     con = db()
-    r = con.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
-    con.close()
-    return r
+    try:
+        return con.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+    finally:
+        con.close()
 
 
 def resolve_product_for_guild(product_id, guild_id, repair=True):
@@ -1661,16 +1662,18 @@ def resolve_product_for_guild(product_id, guild_id, repair=True):
 
 def get_order(oid):
     con = db()
-    r = con.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
-    con.close()
-    return r
+    try:
+        return con.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    finally:
+        con.close()
 
 
 def get_cfg(gid):
     con = db()
-    r = con.execute("SELECT * FROM guild_config WHERE guild_id=?", (gid,)).fetchone()
-    con.close()
-    return r
+    try:
+        return con.execute("SELECT * FROM guild_config WHERE guild_id=?", (gid,)).fetchone()
+    finally:
+        con.close()
 
 
 def normalize_coupon_code(value):
@@ -2183,6 +2186,55 @@ class LinkView(discord.ui.View):
         self.add_item(discord.ui.Button(label="🛒 Ir para o Carrinho", url=url))
 
 
+async def _checkout_db_call(operation, *args):
+    """Consulta síncrona do banco fora do loop de eventos do Discord."""
+    return await asyncio.wait_for(asyncio.to_thread(operation, *args), timeout=12)
+
+
+def _open_cart_data(product_id, guild_id):
+    product = get_product(product_id)
+    if not product or int(product["guild_id"]) != int(guild_id):
+        return None, [], None
+    parent = get_checkout_variant_parent(int(product["id"]), guild_id)
+    if parent:
+        product = parent
+    variants = get_checkout_variants(int(product["id"]), guild_id)
+    cfg = get_cfg(guild_id)
+    return product, variants, cfg
+
+
+def _save_cart_category(category_id, guild_id):
+    con = db()
+    try:
+        con.execute(
+            "UPDATE guild_config SET cart_category_id=? WHERE guild_id=?",
+            (category_id, guild_id),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _base_cart_pricing(value):
+    price = round(float(value), 2)
+    return {
+        "original": price,
+        "coupon_code": None,
+        "percent": 0.0,
+        "discount": 0.0,
+        "final": price,
+    }
+
+
+def _purchase_data(product_id, guild_id, channel_id):
+    product = get_product(product_id)
+    if not product or int(product["guild_id"]) != int(guild_id):
+        return None, None, None
+    pricing = get_cart_pricing(channel_id, guild_id, product["price"])
+    affiliate = get_cart_affiliate(channel_id, guild_id)
+    return product, pricing, affiliate
+
+
 async def _send_logo_cart_message(channel, content=None, embed=None, view=None):
     """
     Envia o card com a logo como imagem GRANDE embaixo do embed.
@@ -2290,19 +2342,31 @@ class CheckoutVariantView(discord.ui.View):
             )
             return
 
-        parent = get_product(self.parent_id)
-        variants = get_checkout_variants(self.parent_id, i.guild.id)
+        await i.response.defer()
+        try:
+            parent, variants = await _checkout_db_call(
+                lambda: (get_product(self.parent_id), get_checkout_variants(self.parent_id, i.guild.id))
+            )
+        except Exception as exc:
+            print(f"[VARIANTES] banco indisponível: {type(exc).__name__}")
+            await i.followup.send("⚠️ O banco está demorando. Tente novamente em instantes.", ephemeral=True)
+            return
         selected = next((row for row in variants if int(row["id"]) == int(product_id)), None)
         if not parent or not selected:
-            await i.response.send_message("❌ Esta opção não existe mais.", ephemeral=True)
+            await i.followup.send("❌ Esta opção não existe mais.", ephemeral=True)
             return
         if int(selected["active"] or 0) != 1 or int(selected["stock"] or 0) == 0:
-            await i.response.send_message("❌ Esta opção está indisponível no momento.", ephemeral=True)
+            await i.followup.send("❌ Esta opção está indisponível no momento.", ephemeral=True)
             return
 
         # Se o administrador alterou o preço enquanto o carrinho estava aberto,
         # tudo abaixo usa o valor ATUAL do banco.
-        clear_cart_coupon(i.channel.id)
+        try:
+            await _checkout_db_call(clear_cart_coupon, i.channel.id)
+        except Exception as exc:
+            print(f"[VARIANTES] não foi possível limpar cupom: {type(exc).__name__}")
+            await i.followup.send("⚠️ O banco está demorando. Tente novamente em instantes.", ephemeral=True)
+            return
         try:
             await i.channel.edit(
                 topic=f"user={self.uid};product={int(selected['id'])};parent={self.parent_id};variant={normalize_variant_key(selected['variant_key'])}"
@@ -2316,7 +2380,7 @@ class CheckoutVariantView(discord.ui.View):
         for child in locked_view.children:
             child.disabled = True
 
-        await i.response.edit_message(
+        await i.message.edit(
             embed=build_variant_picker_embed(parent, variants, selected_id=int(selected["id"])),
             view=locked_view,
         )
@@ -2337,7 +2401,7 @@ class CheckoutVariantView(discord.ui.View):
             view=StartView(int(selected["id"]), self.uid),
         )
 
-        pricing = get_cart_pricing(i.channel.id, i.guild.id, selected["price"])
+        pricing = _base_cart_pricing(selected["price"])
         item = build_cart_item_embed(selected, pricing)
         item.add_field(
             name="Tipo de acesso",
@@ -2351,22 +2415,25 @@ class CheckoutVariantView(discord.ui.View):
 
 
 async def open_cart(interaction, product_id):
-    p = get_product(product_id)
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send("Abra o carrinho no servidor da loja.", ephemeral=True)
+        return
+    try:
+        p, variants, cfg = await _checkout_db_call(_open_cart_data, product_id, guild.id)
+    except Exception as exc:
+        print(f"[CARRINHO] banco indisponível: {type(exc).__name__}")
+        await interaction.followup.send(
+            "⚠️ Não consegui consultar o banco da loja agora. "
+            "Nenhuma compra foi iniciada; tente novamente em instantes.",
+            ephemeral=True,
+        )
+        return
     if not p or int(p["active"] or 0) != 1:
         await interaction.followup.send("❌ Produto indisponível.", ephemeral=True)
         return
-
-    guild = interaction.guild
-
-    # Se alguém chamar open_cart() diretamente usando um produto-filho,
-    # volta automaticamente para o produto-base. Assim o cliente sempre vê
-    # Mensal/Permanente antes de continuar.
-    parent = get_checkout_variant_parent(int(p["id"]), guild.id)
-    if parent:
-        p = parent
-        product_id = int(parent["id"])
-
-    variants = get_checkout_variants(product_id, guild.id)
+    # _open_cart_data já resolveu produtos-filhos para o produto-base.
+    product_id = int(p["id"])
     grouped_checkout = len(variants) > 0
 
     if grouped_checkout and len(variants) < 2:
@@ -2392,7 +2459,6 @@ async def open_cart(interaction, product_id):
         await interaction.followup.send("❌ Produto indisponível.", ephemeral=True)
         return
 
-    cfg = get_cfg(guild.id)
     cat = (
         guild.get_channel(cfg["cart_category_id"])
         if cfg and cfg["cart_category_id"]
@@ -2402,13 +2468,12 @@ async def open_cart(interaction, product_id):
         cat = discord.utils.get(
             guild.categories, name="🛒 Carrinhos"
         ) or await guild.create_category("🛒 Carrinhos")
-        con = db()
-        con.execute(
-            "UPDATE guild_config SET cart_category_id=? WHERE guild_id=?",
-            (cat.id, guild.id),
-        )
-        con.commit()
-        con.close()
+        try:
+            await _checkout_db_call(_save_cart_category, cat.id, guild.id)
+        except Exception as exc:
+            print(f"[CARRINHO] erro ao salvar categoria: {type(exc).__name__}")
+            await interaction.followup.send("⚠️ O banco está demorando. Tente novamente em instantes.", ephemeral=True)
+            return
 
     # UM carrinho por cliente. Escolher Mensal/Permanente não cria outro canal.
     existing = next(
@@ -2472,7 +2537,8 @@ async def open_cart(interaction, product_id):
         embed=intro,
         view=StartView(product_id, interaction.user.id),
     )
-    pricing = get_cart_pricing(ch.id, guild.id, p["price"])
+    # Canal recém-criado: ainda não existe cupom salvo para ele.
+    pricing = _base_cart_pricing(p["price"])
     item = build_cart_item_embed(p, pricing)
     await ch.send(
         embed=item,
@@ -2804,10 +2870,19 @@ class StartView(discord.ui.View):
     async def go(self, i, b):
         if not await self.ok(i):
             return
-        p = get_product(self.pid)
-        pricing = get_cart_pricing(i.channel.id, i.guild.id, p["price"])
+        await i.response.defer(thinking=True)
+        try:
+            p, pricing, affiliate = await _checkout_db_call(
+                _purchase_data, self.pid, i.guild.id, i.channel.id
+            )
+        except Exception as exc:
+            print(f"[CARRINHO] resumo indisponível: {type(exc).__name__}")
+            await i.followup.send("⚠️ O banco está demorando. Tente continuar em instantes.", ephemeral=True)
+            return
+        if p is None:
+            await i.followup.send("❌ Produto indisponível.", ephemeral=True)
+            return
         e = build_summary_embed(p, pricing)
-        affiliate = get_cart_affiliate(i.channel.id, i.guild.id)
         if affiliate:
             e.add_field(
                 name="🤝 Afiliado selecionado",
@@ -2817,7 +2892,7 @@ class StartView(discord.ui.View):
                 ),
                 inline=False,
             )
-        await i.response.send_message(
+        await i.followup.send(
             embed=e,
             view=SummaryView(self.pid, self.uid),
         )
@@ -2861,8 +2936,18 @@ class SummaryView(discord.ui.View):
         if i.user.id != self.uid:
             await i.response.send_message("Carrinho de outra pessoa.", ephemeral=True)
             return
-        p = get_product(self.pid)
-        pricing = get_cart_pricing(i.channel.id, i.guild.id, p["price"])
+        await i.response.defer(thinking=True)
+        try:
+            p, pricing, affiliate = await _checkout_db_call(
+                _purchase_data, self.pid, i.guild.id, i.channel.id
+            )
+        except Exception as exc:
+            print(f"[CARRINHO] pagamento indisponível: {type(exc).__name__}")
+            await i.followup.send("⚠️ O banco está demorando. Tente continuar em instantes.", ephemeral=True)
+            return
+        if p is None:
+            await i.followup.send("❌ Produto indisponível.", ephemeral=True)
+            return
         e = discord.Embed(
             title="ENTREGAS AUTOMÁTICAS | Sistema de pagamento",
             description="Escolha a forma de pagamento.",
@@ -2890,14 +2975,13 @@ class SummaryView(discord.ui.View):
             value=f"**{money(pricing['final'])}**",
             inline=False,
         )
-        affiliate = get_cart_affiliate(i.channel.id, i.guild.id)
         if affiliate:
             e.add_field(
                 name="🤝 Afiliado selecionado",
                 value=f"<@{affiliate['discord_user_id']}> • indicação registrada",
                 inline=False,
             )
-        await i.response.send_message(
+        await i.followup.send(
             embed=e,
             view=PaymentView(self.pid, self.uid),
         )

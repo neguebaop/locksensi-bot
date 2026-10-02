@@ -137,7 +137,9 @@ class CompatConnection:
             raise RuntimeError(
                 "SUPABASE_DB_URL não configurada. Coloque a URI do Session Pooler nos Secrets do Replit."
             )
-        self._conn = psycopg.connect(DATABASE_URL, connect_timeout=15, autocommit=False)
+        # Falhe rápido se o pooler estiver indisponível; o menu do Discord
+        # informará a falha sem bloquear as outras interações.
+        self._conn = psycopg.connect(DATABASE_URL, connect_timeout=5, autocommit=False)
         self._lastrowid: Optional[int] = None
 
     def cursor(self) -> CompatCursor:
@@ -159,11 +161,13 @@ class CompatConnection:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type:
-            self.rollback()
-        else:
-            self.commit()
-        self.close()
+        try:
+            if exc_type:
+                self.rollback()
+            else:
+                self.commit()
+        finally:
+            self.close()
 
 
 def translate_sql(sql: str) -> str:
