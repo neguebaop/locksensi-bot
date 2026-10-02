@@ -619,14 +619,29 @@ class PanelSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        if self.values[0] == "none":
-            await interaction.response.send_message(
-                "Nenhum produto neste painel ainda.", ephemeral=True
-            )
-            return
-        # Responde rápido para o Discord não derrubar a interação em hospedagem lenta
+        # Confirma o clique ANTES de ler a seleção ou consultar o banco.
+        # Assim qualquer erro posterior pode ser mostrado no próprio Discord.
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await start_order(interaction, int(self.values[0]))
+        try:
+            values = (interaction.data or {}).get("values") or self.values
+            if not values or values[0] == "none":
+                await interaction.followup.send(
+                    "Nenhum produto neste painel ainda.", ephemeral=True
+                )
+                return
+            product_id = int(values[0])
+            print(f"[SELECAO] painel={self.panel_id} produto={product_id}", flush=True)
+            await start_order(interaction, product_id)
+        except Exception as exc:
+            print(
+                f"[SELECAO] erro painel={self.panel_id}: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            traceback.print_exc()
+            await interaction.followup.send(
+                "⚠️ Não consegui abrir o carrinho agora. Tente novamente em instantes.",
+                ephemeral=True,
+            )
 
 
 async def smart_send(interaction: discord.Interaction, *args, **kwargs):

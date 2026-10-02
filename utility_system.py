@@ -284,12 +284,21 @@ class VoiceCommands(app_commands.Group):
 
 
 async def ensure_voice(guild):
-    con = db()
-    row = con.execute(
-        "SELECT * FROM guild_voice_config WHERE guild_id=? AND enabled=1",
-        (guild.id,),
-    ).fetchone()
-    con.close()
+    def load_voice_config():
+        con = db()
+        try:
+            return con.execute(
+                "SELECT * FROM guild_voice_config WHERE guild_id=? AND enabled=1",
+                (guild.id,),
+            ).fetchone()
+        finally:
+            con.close()
+
+    try:
+        row = await asyncio.wait_for(asyncio.to_thread(load_voice_config), timeout=12)
+    except Exception as exc:
+        print(f"[VOZ] banco indisponível servidor={guild.id}: {type(exc).__name__}")
+        return
 
     if not row:
         return
@@ -331,8 +340,6 @@ async def setup(bot, admin_check=None):
 
     BOT = bot
     ADMIN_CHECK = admin_check
-    init_db()
-
     for command in (MessageCommands(), VoiceCommands()):
         try:
             bot.tree.add_command(command)
