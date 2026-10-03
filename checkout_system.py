@@ -24,6 +24,7 @@ BOT = None
 ADMIN_CHECK = None
 LICENSE_ORDER_LOCKS = {}
 HWID_RESET_LOCKS = {}
+CART_OPEN_LOCKS = {}
 
 # Logo exibida na parte de BAIXO do card do carrinho quando o produto
 # possui as opções Mensal/Permanente. Pode ser sobrescrita por variável
@@ -2416,6 +2417,62 @@ class CheckoutVariantView(discord.ui.View):
         )
 
 
+def _cart_setup_messages(messages, bot_id):
+    """Reconhece o conteúdo inicial, inclusive em carrinhos de versões antigas."""
+    titles = {
+        str(embed.title or "")
+        for message in messages
+        if getattr(getattr(message, "author", None), "id", None) == bot_id
+        for embed in message.embeds
+    }
+    return (
+        any(title.startswith("🛒 ") and title.endswith(" | Sistema de compra") for title in titles),
+        "ENTREGAS AUTOMÁTICAS | Sistema de compra" in titles,
+        "📦 Item do carrinho" in titles,
+    )
+
+
+async def _populate_cart(channel, user, product, variants, grouped, state):
+    picker_sent, intro_sent, item_sent = state
+    product_id = int(product["id"])
+    if grouped:
+        if not picker_sent:
+            await _send_logo_cart_message(
+                channel,
+                content=user.mention,
+                embed=build_variant_picker_embed(product, variants),
+                view=CheckoutVariantView(product_id, user.id, variants),
+            )
+        return
+
+    if not intro_sent:
+        intro = discord.Embed(
+            title="ENTREGAS AUTOMÁTICAS | Sistema de compra",
+            description=(
+                f"📣 Olá {user.mention}, confira seu produto abaixo.\n\n"
+                "📕 Leia os termos antes de continuar.\n\n"
+                "🔐 **Por exigência da instituição financeira, precisamos do CPF "
+                "apenas para emissão do PIX. O dado não será publicado no servidor.**"
+            ),
+            color=0x8B2CF5,
+        )
+        if valid_url(product["banner_url"]):
+            intro.set_image(url=product["banner_url"])
+        await channel.send(
+            user.mention,
+            embed=intro,
+            view=StartView(product_id, user.id),
+        )
+    if not item_sent:
+        # O primeiro envio pode ter funcionado antes de uma falha de rede.
+        # No próximo clique, envia somente a parte que ainda falta.
+        pricing = _base_cart_pricing(product["price"])
+        await channel.send(
+            embed=build_cart_item_embed(product, pricing),
+            view=CartItemView(product_id, user.id),
+        )
+
+
 async def open_cart(interaction, product_id):
     guild = interaction.guild
     if guild is None:
@@ -2461,91 +2518,119 @@ async def open_cart(interaction, product_id):
         await interaction.followup.send("❌ Produto indisponível.", ephemeral=True)
         return
 
-    cat = (
-        guild.get_channel(cfg["cart_category_id"])
-        if cfg and cfg["cart_category_id"]
-        else None
-    )
-    if not isinstance(cat, discord.CategoryChannel):
-        cat = discord.utils.get(
-            guild.categories, name="🛒 Carrinhos"
-        ) or await guild.create_category("🛒 Carrinhos")
+    # Dois cliques simultâneos do mesmo cliente não podem criar dois canais.
+    lock = CART_OPEN_LOCKS.setdefault((guild.id, interaction.user.id), asyncio.Lock())
+    async with lock:
+        cat = (
+            guild.get_channel(cfg["cart_category_id"])
+            if cfg and cfg["cart_category_id"]
+            else None
+        )
+        if not isinstance(cat, discord.CategoryChannel):
+            cat = discord.utils.get(
+                guild.categories, name="🛒 Carrinhos"
+            ) or await guild.create_category("🛒 Carrinhos")
+            try:
+                await _checkout_db_call(_save_cart_category, cat.id, guild.id)
+            except Exception as exc:
+                # A categoria já existe; falhar ao salvar o ID não invalida o carrinho.
+                print(f"[CARRINHO] erro ao salvar categoria: {type(exc).__name__}: {exc}", flush=True)
+
+        name = f"carrinho-{interaction.user.id}"
+        ch = discord.utils.get(cat.text_channels, name=name)
+        created = False
+        state = (False, False, False)
+        if ch:
+            try:
+                messages = [message async for message in ch.history(limit=40, oldest_first=True)]
+            except discord.Forbidden:
+                # Canais antigos podem ter sido criados sem essa permissão explícita.
+                overwrite = ch.overwrites_for(guild.me)
+                overwrite.view_channel = True
+                overwrite.send_messages = True
+                overwrite.read_message_history = True
+                await ch.set_permissions(guild.me, overwrite=overwrite)
+                messages = [message async for message in ch.history(limit=40, oldest_first=True)]
+            state = _cart_setup_messages(messages, guild.me.id)
+            ready = state[0] if grouped_checkout else state[1] and state[2]
+            if ready:
+                await interaction.followup.send(
+                    f"Você já tem um carrinho: {ch.mention}", ephemeral=True
+                )
+                return
+            # Caso a primeira mensagem tenha sido enviada, mantenha o produto
+            # daquele carrinho ao completar a segunda mensagem.
+            saved = re.search(r"(?:^|;)product=(\d+)(?:;|$)", ch.topic or "")
+            if messages and saved and int(saved.group(1)) != product_id:
+                old_p, old_variants, _ = await _checkout_db_call(
+                    _open_cart_data, int(saved.group(1)), guild.id
+                )
+                if not old_p or int(old_p["active"] or 0) != 1:
+                    await interaction.followup.send(
+                        "⚠️ Seu carrinho anterior está incompleto e o produto dele "
+                        "não está mais disponível. Peça à equipe para fechar esse canal "
+                        "e tente novamente.",
+                        ephemeral=True,
+                    )
+                    return
+                p, variants = old_p, old_variants
+                product_id = int(p["id"])
+                grouped_checkout = bool(variants)
+                ready = state[0] if grouped_checkout else state[1] and state[2]
+                if ready:
+                    await interaction.followup.send(
+                        f"Você já tem um carrinho: {ch.mention}", ephemeral=True
+                    )
+                    return
+            if not messages:
+                await ch.edit(
+                    topic=f"user={interaction.user.id};product={product_id};grouped={int(grouped_checkout)}"
+                )
+            print(f"[CARRINHO] reparando canal={ch.id} estado={state}", flush=True)
+        else:
+            ow = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                interaction.user: discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True
+                ),
+                guild.me: discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True,
+                    manage_channels=True
+                ),
+            }
+            ch = await guild.create_text_channel(
+                name,
+                category=cat,
+                overwrites=ow,
+                topic=f"user={interaction.user.id};product={product_id};grouped={int(grouped_checkout)}",
+            )
+            created = True
+
         try:
-            await _checkout_db_call(_save_cart_category, cat.id, guild.id)
+            await _populate_cart(ch, interaction.user, p, variants, grouped_checkout, state)
         except Exception as exc:
-            print(f"[CARRINHO] erro ao salvar categoria: {type(exc).__name__}")
-            await interaction.followup.send("⚠️ O banco está demorando. Tente novamente em instantes.", ephemeral=True)
+            print(f"[CARRINHO] falha ao preencher canal={ch.id}: {type(exc).__name__}: {exc}", flush=True)
+            if created:
+                try:
+                    await ch.delete(reason="Falha ao montar carrinho; cliente poderá tentar novamente")
+                except Exception as cleanup_exc:
+                    print(f"[CARRINHO] falha ao limpar canal={ch.id}: {cleanup_exc}", flush=True)
+            await interaction.followup.send(
+                "⚠️ Não consegui montar o carrinho agora. Tente novamente; "
+                "um canal incompleto será reparado automaticamente.",
+                ephemeral=True,
+            )
             return
 
-    # UM carrinho por cliente. Escolher Mensal/Permanente não cria outro canal.
-    existing = next(
-        (
-            c
-            for c in cat.text_channels
-            if c.name.startswith(f"carrinho-{interaction.user.id}")
-        ),
-        None,
-    )
-    if existing:
-        await interaction.followup.send(
-            f"Você já tem um carrinho: {existing.mention}", ephemeral=True
+        # Somente confirma sucesso depois que os botões de compra estão no canal.
+        e = discord.Embed(
+            title="ENTREGAS AUTOMÁTICAS | Carrinho aberto",
+            description=f"✅ {interaction.user.mention}, seu carrinho está pronto.",
+            color=0x8B2CF5,
         )
-        return
-
-    ow = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        interaction.user: discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, read_message_history=True
-        ),
-        guild.me: discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, manage_channels=True
-        ),
-    }
-    ch = await guild.create_text_channel(
-        f"carrinho-{interaction.user.id}",
-        category=cat,
-        overwrites=ow,
-        topic=f"user={interaction.user.id};product={product_id};grouped={1 if grouped_checkout else 0}",
-    )
-
-    e = discord.Embed(
-        title="ENTREGAS AUTOMÁTICAS | Carrinho aberto",
-        description=f"✅ {interaction.user.mention}, seu carrinho foi aberto com sucesso.",
-        color=0x8B2CF5,
-    )
-    channel_url = f"https://discord.com/channels/{guild.id}/{ch.id}"
-    await interaction.followup.send(embed=e, view=LinkView(channel_url), ephemeral=True)
-
-    if grouped_checkout:
-        picker = build_variant_picker_embed(p, variants)
-        await _send_logo_cart_message(
-            ch,
-            content=interaction.user.mention,
-            embed=picker,
-            view=CheckoutVariantView(product_id, interaction.user.id, variants),
-        )
-        return
-
-    # Checkout antigo continua 100% compatível para produtos sem variantes.
-    intro = discord.Embed(
-        title="ENTREGAS AUTOMÁTICAS | Sistema de compra",
-        description=f"📣 Olá {interaction.user.mention}, confira seu produto abaixo.\n\n📕 Leia os termos antes de continuar.\n\n🔐 **Por exigência da instituição financeira, precisamos do CPF apenas para emissão do PIX. O dado não será publicado no servidor.**",
-        color=0x8B2CF5,
-    )
-    if valid_url(p["banner_url"]):
-        intro.set_image(url=p["banner_url"])
-    await ch.send(
-        interaction.user.mention,
-        embed=intro,
-        view=StartView(product_id, interaction.user.id),
-    )
-    # Canal recém-criado: ainda não existe cupom salvo para ele.
-    pricing = _base_cart_pricing(p["price"])
-    item = build_cart_item_embed(p, pricing)
-    await ch.send(
-        embed=item,
-        view=CartItemView(product_id, interaction.user.id),
-    )
+        channel_url = f"https://discord.com/channels/{guild.id}/{ch.id}"
+        print(f"[CARRINHO] pronto canal={ch.id} cliente={interaction.user.id}", flush=True)
+        await interaction.followup.send(embed=e, view=LinkView(channel_url), ephemeral=True)
 
 
 class CouponModal(discord.ui.Modal, title="Inserir cupom"):

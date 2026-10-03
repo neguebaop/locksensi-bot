@@ -3284,6 +3284,7 @@ if not getattr(app, "_verification_routes", False):
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN não foi carregado no Render.")
 
+print("[BUILD] 2026-10-03-carrinho-reparo-v2", flush=True)
 print("[STARTUP] DISCORD_TOKEN carregado: SIM", flush=True)
 keep_alive()
 print("[STARTUP] Conectando ao Discord com discord.py...", flush=True)
