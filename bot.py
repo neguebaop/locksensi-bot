@@ -1,4 +1,4 @@
-import os, asyncio, json, io, random, string, traceback, re
+import os, asyncio, json, io, random, string, traceback, re, time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -8,7 +8,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import qrcode
 from flask import Flask, request, jsonify
-from threading import Thread
+from threading import Thread, Lock
 from database import db, ensure_schema
 import checkout_system
 import verification_system
@@ -335,6 +335,81 @@ async def log(guild: discord.Guild, msg: str):
 
 
 # ================= UI VENDAS =================
+_MENU_CACHE = {}
+_MENU_CACHE_LOCK = Lock()
+_MENU_CACHE_SECONDS = 8
+_MENU_REFRESH_TASKS = {}
+
+
+def _cached_panel_products(panel_id):
+    with _MENU_CACHE_LOCK:
+        return _MENU_CACHE.get(int(panel_id))
+
+
+def _remember_panel_products(panel_id, rows):
+    with _MENU_CACHE_LOCK:
+        _MENU_CACHE[int(panel_id)] = (time.monotonic(), tuple(rows))
+
+
+def _query_panel_products(con, panel_id=None):
+    """Uma consulta curta para o menu, sem carregar banners e textos dos produtos."""
+    where = "AND pp.panel_id=?" if panel_id is not None else ""
+    params = (int(panel_id),) if panel_id is not None else ()
+    order = "pp.panel_id, p.price, p.id" if panel_id is None else "p.price, p.id"
+    base = """
+        SELECT pp.panel_id AS menu_panel_id, p.id, p.name, p.price, p.stock
+        FROM panel_products pp
+        JOIN products p ON p.id=pp.product_id
+        WHERE p.active=1
+    """ + where
+    try:
+        # Evita deixar uma consulta presa indefinidamente por bloqueio no banco.
+        con._conn.execute("SET LOCAL statement_timeout = '6000ms'")
+        return con.execute(
+            base + """
+            AND NOT EXISTS (
+                SELECT 1 FROM checkout_variants cv
+                WHERE cv.variant_product_id=p.id AND cv.guild_id=p.guild_id
+            )
+            ORDER BY """ + order,
+            params,
+        ).fetchall()
+    except Exception as exc:
+        if getattr(exc, "sqlstate", None) != "42P01":
+            raise
+        # PostgreSQL invalida a transação após UndefinedTable. Sem rollback, a
+        # consulta alternativa sempre falha com InFailedSqlTransaction.
+        con.rollback()
+        con._conn.execute("SET LOCAL statement_timeout = '6000ms'")
+        return con.execute(base + " ORDER BY " + order, params).fetchall()
+
+
+def _refresh_menu_finished(panel_id, task):
+    if _MENU_REFRESH_TASKS.get(panel_id) is task:
+        _MENU_REFRESH_TASKS.pop(panel_id, None)
+    if not task.cancelled():
+        error = task.exception()
+        if error is not None:
+            print(
+                f"[MENU PRODUTOS] painel={panel_id}: "
+                f"{type(error).__name__}: {str(error)[:350]}",
+                flush=True,
+            )
+
+
+def _start_menu_refresh(panel_id):
+    task = _MENU_REFRESH_TASKS.get(panel_id)
+    if task is None or task.done():
+        task = asyncio.create_task(
+            asyncio.to_thread(PanelSelect.load_products, panel_id)
+        )
+        _MENU_REFRESH_TASKS[panel_id] = task
+        task.add_done_callback(
+            lambda finished, pid=panel_id: _refresh_menu_finished(pid, finished)
+        )
+    return task
+
+
 class ProductBuyButton(discord.ui.Button):
     def __init__(self, product_id: int):
         super().__init__(
@@ -404,12 +479,19 @@ class PanelOptionsButton(discord.ui.Button):
         # e, em hospedagens como Render, pode levar mais de 3 segundos.
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            # Só a consulta pode rodar na thread. Views criadas fora do loop
-            # do Discord não recebem os cliques no menu de seleção.
-            rows = await asyncio.wait_for(
-                asyncio.to_thread(PanelSelect.load_products, self.panel_id),
-                timeout=12,
-            )
+            cached = _cached_panel_products(self.panel_id)
+            if cached is not None:
+                rows = cached[1]
+                if time.monotonic() - cached[0] > _MENU_CACHE_SECONDS:
+                    # O cliente recebe o menu imediatamente; a atualização
+                    # ocorre em segundo plano para os próximos cliques.
+                    _start_menu_refresh(self.panel_id)
+            else:
+                rows = await asyncio.wait_for(
+                    asyncio.to_thread(PanelSelect.load_products, self.panel_id),
+                    timeout=7,
+                )
+            # Views Discord precisam ser criadas no loop, nunca na thread SQL.
             view = PanelOnlyView(self.panel_id, product_rows=rows)
             await interaction.followup.send(
                 "**Selecione um Produto**",
@@ -417,9 +499,14 @@ class PanelOptionsButton(discord.ui.Button):
                 ephemeral=True,
             )
         except Exception as exc:
-            print(f"[MENU PRODUTOS] painel={self.panel_id}: {type(exc).__name__}")
+            print(
+                f"[MENU PRODUTOS] painel={self.panel_id}: "
+                f"{type(exc).__name__}: {str(exc)[:350]}",
+                flush=True,
+            )
             await interaction.followup.send(
-                "⚠️ O banco da loja está demorando. Tente abrir as opções novamente em instantes.",
+                "⚠️ Não consegui consultar os produtos da loja agora. "
+                "Nenhuma compra foi iniciada; tente novamente em instantes.",
                 ephemeral=True,
             )
 
@@ -580,37 +667,9 @@ class PanelSelect(discord.ui.Select):
     def load_products(panel_id: int):
         con = db()
         try:
-            # Produtos usados como variantes são escolhidos dentro do carrinho.
-            try:
-                return con.execute(
-                    """
-                    SELECT p.*
-                    FROM products p
-                    JOIN panel_products pp ON p.id=pp.product_id
-                    WHERE pp.panel_id=?
-                      AND p.active=1
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM checkout_variants cv
-                          WHERE cv.variant_product_id=p.id
-                            AND cv.guild_id=p.guild_id
-                      )
-                    ORDER BY p.price ASC
-                    """,
-                    (panel_id,),
-                ).fetchall()
-            except Exception as exc:
-                print(f"[MENU PRODUTOS] fallback sem variantes: {exc}")
-                return con.execute(
-                    """
-                    SELECT p.*
-                    FROM products p
-                    JOIN panel_products pp ON p.id=pp.product_id
-                    WHERE pp.panel_id=? AND p.active=1
-                    ORDER BY p.price ASC
-                    """,
-                    (panel_id,),
-                ).fetchall()
+            rows = _query_panel_products(con, panel_id)
+            _remember_panel_products(panel_id, rows)
+            return rows
         finally:
             con.close()
 
@@ -624,11 +683,11 @@ class PanelSelect(discord.ui.Select):
         else:
             rows = product_rows if product_rows is not None else self.load_products(panel_id)
             for p in rows[:25]:
-                stock = "∞" if p["stock"] < 0 else str(p["stock"])
+                stock = "∞" if p["stock"] is None or p["stock"] < 0 else str(p["stock"])
                 options.append(
                     discord.SelectOption(
-                        label=p["name"][:100],
-                        description=f"{money(p['price'])} | Estoque: {stock}",
+                        label=str(p["name"] or "Produto")[:100],
+                        description=f"{money(p['price'] or 0)} | Estoque: {stock}",
                         emoji="🛒",
                         value=str(p["id"]),
                     )
@@ -1277,6 +1336,37 @@ def _load_persistent_view_ids():
         con.close()
 
 
+def _load_menu_snapshot():
+    con = db()
+    try:
+        return _query_panel_products(con)
+    finally:
+        con.close()
+
+
+async def warm_panel_menus(panel_ids):
+    """Prepara os menus depois de restaurar os botões persistentes."""
+    while not bot.is_closed():
+        try:
+            rows = await asyncio.wait_for(
+                asyncio.to_thread(_load_menu_snapshot), timeout=18
+            )
+            menus = {}
+            for row in rows:
+                menus.setdefault(int(row["menu_panel_id"]), []).append(row)
+            for panel_id in panel_ids:
+                _remember_panel_products(panel_id, menus.get(panel_id, []))
+            print(f"[MENU PRODUTOS] {len(menus)} painel(is) em cache", flush=True)
+            return
+        except Exception as exc:
+            print(
+                f"[MENU PRODUTOS] pré-carga indisponível: "
+                f"{type(exc).__name__}: {str(exc)[:350]}",
+                flush=True,
+            )
+            await asyncio.sleep(30)
+
+
 async def restore_store_views():
     """Restaurar painéis sem bloquear os heartbeats e demais botões."""
     while not bot.is_closed():
@@ -1304,6 +1394,10 @@ async def restore_store_views():
                 f"Views persistentes restauradas: {len(paineis)} painel(is), "
                 f"{len(produtos)} produto(s) e {len(rankings)} ranking(s)"
             )
+            if not getattr(bot, "_menu_warmup_task", None):
+                bot._menu_warmup_task = asyncio.create_task(
+                    warm_panel_menus([int(row["id"]) for row in paineis])
+                )
             for guild in bot.guilds:
                 try:
                     await asyncio.wait_for(
