@@ -2571,29 +2571,40 @@ class CouponModal(discord.ui.Modal, title="Inserir cupom"):
             )
             return
 
+        await i.response.defer(ephemeral=True, thinking=True)
         coupon_code = normalize_coupon_code(str(self.coupon))
-        product = get_product(self.pid)
+        try:
+            product = await _checkout_db_call(get_product, self.pid)
+        except Exception as exc:
+            print(f"[CUPOM] consulta do produto: {type(exc).__name__}: {exc}", flush=True)
+            await i.followup.send("⚠️ A loja está demorando. Tente novamente.", ephemeral=True)
+            return
         if not product or int(product["guild_id"]) != i.guild.id:
-            await i.response.send_message("❌ Produto não encontrado.", ephemeral=True)
+            await i.followup.send("❌ Produto não encontrado.", ephemeral=True)
             return
 
-        coupon_any = get_coupon_any_state(i.guild.id, coupon_code)
+        try:
+            coupon_any = await _checkout_db_call(get_coupon_any_state, i.guild.id, coupon_code)
+        except Exception as exc:
+            print(f"[CUPOM] consulta do cupom: {type(exc).__name__}: {exc}", flush=True)
+            await i.followup.send("⚠️ A loja está demorando. Tente novamente.", ephemeral=True)
+            return
         if not coupon_any:
-            await i.response.send_message(
+            await i.followup.send(
                 "❌ Cupom não encontrado.",
                 ephemeral=True,
             )
             return
 
         if int(coupon_any["active"] or 0) != 1:
-            await i.response.send_message(
+            await i.followup.send(
                 "❌ Este cupom está desativado.",
                 ephemeral=True,
             )
             return
 
         if coupon_is_expired(coupon_any):
-            await i.response.send_message(
+            await i.followup.send(
                 "❌ Este cupom expirou.",
                 ephemeral=True,
             )
@@ -2602,7 +2613,7 @@ class CouponModal(discord.ui.Modal, title="Inserir cupom"):
         if coupon_any["product_id"] is not None and int(
             coupon_any["product_id"]
         ) != int(self.pid):
-            await i.response.send_message(
+            await i.followup.send(
                 "❌ Este cupom não é válido para este produto.",
                 ephemeral=True,
             )
@@ -2611,7 +2622,7 @@ class CouponModal(discord.ui.Modal, title="Inserir cupom"):
         max_uses = coupon_any["max_uses"]
         used_count = int(coupon_any["used_count"] or 0)
         if max_uses is not None and used_count >= int(max_uses):
-            await i.response.send_message(
+            await i.followup.send(
                 "❌ Este cupom esgotou todas as utilizações.",
                 ephemeral=True,
             )
@@ -2619,17 +2630,23 @@ class CouponModal(discord.ui.Modal, title="Inserir cupom"):
 
         coupon = coupon_any
 
-        set_cart_coupon(
-            i.channel.id,
-            i.guild.id,
-            i.user.id,
-            self.pid,
-            coupon["code"],
-            coupon["discount_percent"],
-        )
-        pricing = get_cart_pricing(i.channel.id, i.guild.id, product["price"])
-
-        await i.response.defer(ephemeral=True)
+        try:
+            await asyncio.to_thread(
+                set_cart_coupon,
+                i.channel.id,
+                i.guild.id,
+                i.user.id,
+                self.pid,
+                coupon["code"],
+                coupon["discount_percent"],
+            )
+            pricing = await _checkout_db_call(
+                get_cart_pricing, i.channel.id, i.guild.id, product["price"]
+            )
+        except Exception as exc:
+            print(f"[CUPOM] aplicação: {type(exc).__name__}: {exc}", flush=True)
+            await i.followup.send("⚠️ Não consegui aplicar o cupom agora. Tente novamente.", ephemeral=True)
+            return
 
         if self.source_message:
             try:
@@ -2655,8 +2672,8 @@ class CouponModal(discord.ui.Modal, title="Inserir cupom"):
         )
 
 
-def build_affiliates_embed(guild_id, selected_id=None, page=0, page_size=20):
-    rows = get_affiliates(guild_id)
+def build_affiliates_embed(guild_id, selected_id=None, page=0, page_size=20, rows=None):
+    rows = get_affiliates(guild_id) if rows is None else rows
     pages = max(1, math.ceil(len(rows) / page_size))
     page = max(0, min(int(page), pages - 1))
     start = page * page_size
@@ -2717,49 +2734,55 @@ class AffiliateSelect(discord.ui.Select):
         if self.values[0] == "none":
             await i.response.send_message("❌ Nenhum afiliado cadastrado.", ephemeral=True)
             return
+        await i.response.defer()
         try:
-            candidate = get_affiliate(int(self.values[0]), i.guild.id)
+            candidate = await _checkout_db_call(get_affiliate, int(self.values[0]), i.guild.id)
             if candidate and int(candidate["discord_user_id"]) == int(i.user.id):
-                await i.response.send_message(
+                await i.followup.send(
                     "❌ Você não pode atribuir sua própria compra a você mesmo.",
                     ephemeral=True,
                 )
                 return
-            affiliate = set_cart_affiliate(
+            affiliate = await asyncio.to_thread(
+                set_cart_affiliate,
                 self.owner_view.channel_id,
                 i.guild.id,
                 i.user.id,
                 int(self.values[0]),
             )
+            rows = await _checkout_db_call(get_affiliates, i.guild.id)
         except Exception as exc:
-            await i.response.send_message(f"❌ {str(exc)[:300]}", ephemeral=True)
+            await i.followup.send(f"❌ {str(exc)[:300]}", ephemeral=True)
             return
         embed, _rows, page, _pages = build_affiliates_embed(
             i.guild.id,
             selected_id=affiliate["id"],
             page=self.owner_view.page,
+            rows=rows,
         )
-        await i.response.edit_message(
+        await i.edit_original_response(
             embed=embed,
             view=AffiliatePickerView(
                 i.guild.id,
                 self.owner_view.channel_id,
                 self.owner_view.uid,
                 page=page,
+                selected_id=affiliate["id"],
+                rows=rows,
             ),
         )
 
 
 class AffiliatePickerView(discord.ui.View):
-    def __init__(self, guild_id, channel_id, uid, page=0):
+    def __init__(self, guild_id, channel_id, uid, page=0, selected_id=None, rows=()):
         super().__init__(timeout=600)
         self.guild_id = int(guild_id)
         self.channel_id = int(channel_id)
         self.uid = int(uid)
-        current = get_cart_affiliate(channel_id, guild_id)
-        self.selected_id = int(current["id"]) if current else None
+        self.selected_id = int(selected_id) if selected_id else None
+        self.rows = list(rows)
         _embed, rows, self.page, self.pages = build_affiliates_embed(
-            guild_id, self.selected_id, page
+            guild_id, self.selected_id, page, rows=self.rows
         )
         start = self.page * 20
         self.add_item(AffiliateSelect(self, rows[start : start + 20], self.selected_id))
@@ -2768,12 +2791,13 @@ class AffiliatePickerView(discord.ui.View):
 
     async def _turn_page(self, i, page):
         embed, _rows, page, _pages = build_affiliates_embed(
-            self.guild_id, self.selected_id, page
+            self.guild_id, self.selected_id, page, rows=self.rows
         )
         await i.response.edit_message(
             embed=embed,
             view=AffiliatePickerView(
-                self.guild_id, self.channel_id, self.uid, page=page
+                self.guild_id, self.channel_id, self.uid, page=page,
+                selected_id=self.selected_id, rows=self.rows,
             ),
         )
 
@@ -2798,14 +2822,20 @@ class AffiliatePickerView(discord.ui.View):
         if i.user.id != self.uid:
             await i.response.send_message("Carrinho de outra pessoa.", ephemeral=True)
             return
-        clear_cart_affiliate(self.channel_id)
+        await i.response.defer()
+        try:
+            await asyncio.to_thread(clear_cart_affiliate, self.channel_id)
+        except Exception as exc:
+            await i.followup.send(f"❌ {str(exc)[:300]}", ephemeral=True)
+            return
         embed, _rows, page, _pages = build_affiliates_embed(
-            self.guild_id, None, self.page
+            self.guild_id, None, self.page, rows=self.rows
         )
-        await i.response.edit_message(
+        await i.edit_original_response(
             embed=embed,
             view=AffiliatePickerView(
-                self.guild_id, self.channel_id, self.uid, page=page
+                self.guild_id, self.channel_id, self.uid, page=page,
+                selected_id=None, rows=self.rows,
             ),
         )
 
@@ -2814,14 +2844,23 @@ async def open_affiliate_picker(i, pid, uid):
     if i.user.id != uid:
         await i.response.send_message("Carrinho de outra pessoa.", ephemeral=True)
         return
-    current = get_cart_affiliate(i.channel.id, i.guild.id)
+    await i.response.defer(ephemeral=True, thinking=True)
+    try:
+        current, rows = await _checkout_db_call(
+            lambda: (get_cart_affiliate(i.channel.id, i.guild.id), get_affiliates(i.guild.id))
+        )
+    except Exception as exc:
+        print(f"[AFILIADOS] consulta: {type(exc).__name__}: {exc}", flush=True)
+        await i.followup.send("⚠️ Não consegui consultar os afiliados agora.", ephemeral=True)
+        return
     selected_id = int(current["id"]) if current else None
     embed, _rows, page, _pages = build_affiliates_embed(
-        i.guild.id, selected_id, 0
+        i.guild.id, selected_id, 0, rows=rows
     )
-    await i.response.send_message(
+    await i.followup.send(
         embed=embed,
-        view=AffiliatePickerView(i.guild.id, i.channel.id, uid, page),
+        view=AffiliatePickerView(i.guild.id, i.channel.id, uid, page,
+                                 selected_id=selected_id, rows=rows),
         ephemeral=True,
     )
 
@@ -2903,9 +2942,12 @@ class StartView(discord.ui.View):
     async def cancel(self, i, b):
         if not await self.ok(i):
             return
-        clear_cart_coupon(i.channel.id)
-        clear_cart_affiliate(i.channel.id)
         await i.response.send_message("Compra cancelada. Canal será apagado.")
+        try:
+            await asyncio.to_thread(clear_cart_coupon, i.channel.id)
+            await asyncio.to_thread(clear_cart_affiliate, i.channel.id)
+        except Exception as exc:
+            print(f"[CARRINHO] limpeza ao cancelar: {type(exc).__name__}: {exc}", flush=True)
         await asyncio.sleep(4)
         try:
             await i.channel.delete()
@@ -2918,8 +2960,14 @@ class StartView(discord.ui.View):
     async def terms(self, i, b):
         if not await self.ok(i):
             return
-        cfg = get_cfg(i.guild.id)
-        await i.response.send_message(
+        await i.response.defer(ephemeral=True, thinking=True)
+        try:
+            cfg = await _checkout_db_call(get_cfg, i.guild.id)
+        except Exception as exc:
+            print(f"[CARRINHO] termos: {type(exc).__name__}: {exc}", flush=True)
+            await i.followup.send("⚠️ Não consegui consultar os termos agora.", ephemeral=True)
+            return
+        await i.followup.send(
             (cfg["terms_url"] if cfg and cfg["terms_url"] else "") or TERMS_URL,
             ephemeral=True,
         )
@@ -3011,9 +3059,12 @@ class SummaryView(discord.ui.View):
         if i.user.id != self.uid:
             await i.response.send_message("Carrinho de outra pessoa.", ephemeral=True)
             return
-        clear_cart_coupon(i.channel.id)
-        clear_cart_affiliate(i.channel.id)
         await i.response.send_message("Compra cancelada.")
+        try:
+            await asyncio.to_thread(clear_cart_coupon, i.channel.id)
+            await asyncio.to_thread(clear_cart_affiliate, i.channel.id)
+        except Exception as exc:
+            print(f"[CARRINHO] limpeza ao cancelar: {type(exc).__name__}: {exc}", flush=True)
         await asyncio.sleep(3)
         try:
             await i.channel.delete()
@@ -3041,9 +3092,12 @@ class PaymentView(discord.ui.View):
         if i.user.id != self.uid:
             await i.response.send_message("Carrinho de outra pessoa.", ephemeral=True)
             return
-        clear_cart_coupon(i.channel.id)
-        clear_cart_affiliate(i.channel.id)
         await i.response.send_message("Cancelado.")
+        try:
+            await asyncio.to_thread(clear_cart_coupon, i.channel.id)
+            await asyncio.to_thread(clear_cart_affiliate, i.channel.id)
+        except Exception as exc:
+            print(f"[CARRINHO] limpeza ao cancelar: {type(exc).__name__}: {exc}", flush=True)
         await asyncio.sleep(3)
         try:
             await i.channel.delete()
@@ -3086,24 +3140,39 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
 
         await i.response.defer(thinking=True)
 
-        p = get_product(self.pid)
-        pricing = get_cart_pricing(i.channel.id, i.guild.id, p["price"])
+        try:
+            p = await _checkout_db_call(get_product, self.pid)
+            if not p:
+                await i.followup.send("❌ Produto indisponível.", ephemeral=True)
+                return
+            pricing = await _checkout_db_call(
+                get_cart_pricing, i.channel.id, i.guild.id, p["price"]
+            )
+        except Exception as exc:
+            print(f"[PIX] consulta inicial: {type(exc).__name__}: {exc}", flush=True)
+            await i.followup.send("⚠️ O banco está demorando. Tente novamente.", ephemeral=True)
+            return
         final_amount = pricing["final"]
 
         # Sem afiliado, preserva exatamente o split antigo de duas contas.
         # Com afiliado, o split nativo envia a comissão ao streamer. Se houver
         # subdono, o segundo repasse acontece após a confirmação do pagamento.
         try:
-            affiliate_split = affiliate_split_snapshot(
+            affiliate_split = await _checkout_db_call(
+                affiliate_split_snapshot,
                 i.channel.id, i.guild.id, final_amount
             )
-            split = None if affiliate_split else get_product_split(p)
+            split = None if affiliate_split else await _checkout_db_call(get_product_split, p)
         except ValueError as exc:
             await i.followup.send(
                 f"❌ O split deste produto está configurado incorretamente: `{exc}`\n"
                 "Avise um administrador antes de tentar pagar.",
                 ephemeral=True,
             )
+            return
+        except Exception as exc:
+            print(f"[PIX] consulta do split: {type(exc).__name__}: {exc}", flush=True)
+            await i.followup.send("⚠️ O banco está demorando. Tente novamente.", ephemeral=True)
             return
 
         if affiliate_split:
@@ -3117,7 +3186,16 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
             subowner_email = str(subowner["mistic_email"]) if subowner else None
             subowner_percent = affiliate_split["subowner_percent"]
             subowner_amount = affiliate_split["subowner_amount"]
-            if subowner and not mistic_supports_internal_payout(i.guild.id):
+            try:
+                payout_supported = (
+                    await _checkout_db_call(mistic_supports_internal_payout, i.guild.id)
+                    if subowner else True
+                )
+            except Exception as exc:
+                print(f"[PIX] consulta do repasse: {type(exc).__name__}: {exc}", flush=True)
+                await i.followup.send("⚠️ O banco está demorando. Tente novamente.", ephemeral=True)
+                return
+            if not payout_supported:
                 await i.followup.send(
                     "❌ O modo de **3 participantes** está configurado, mas a conta "
                     "MisticPay usa credenciais antigas. Conecte uma Chave de Acesso "
@@ -3141,13 +3219,19 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
         # Se existe cupom, reserva 1 utilização antes de criar o PIX.
         coupon_reserved = False
         if pricing["coupon_code"]:
-            coupon_reserved = reserve_coupon_usage(
-                i.guild.id,
-                pricing["coupon_code"],
-                self.pid,
-            )
+            try:
+                coupon_reserved = await asyncio.to_thread(
+                    reserve_coupon_usage,
+                    i.guild.id,
+                    pricing["coupon_code"],
+                    self.pid,
+                )
+            except Exception as exc:
+                print(f"[PIX] reserva do cupom: {type(exc).__name__}: {exc}", flush=True)
+                await i.followup.send("⚠️ Não consegui reservar o cupom agora.", ephemeral=True)
+                return
             if not coupon_reserved:
-                clear_cart_coupon(i.channel.id)
+                await asyncio.to_thread(clear_cart_coupon, i.channel.id)
                 await i.followup.send(
                     "❌ Este cupom acabou de esgotar ou foi desativado. "
                     "O PIX não foi gerado. Volte ao carrinho e tente novamente.",
@@ -3155,11 +3239,12 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
                 )
                 return
 
-        con = db()
-        cur = con.cursor()
         local = f"EA-{code(12)}"
-        try:
-            cur.execute(
+        def insert_order():
+            con = db()
+            cur = con.cursor()
+            try:
+                cur.execute(
                 """
             INSERT INTO orders(
                 guild_id,user_id,product_id,product_name,amount,
@@ -3207,15 +3292,23 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
                     now_iso(),
                 ),
             )
-            oid = cur.lastrowid
-            con.commit()
-        except Exception:
-            con.rollback()
-            if coupon_reserved:
-                release_coupon_usage(i.guild.id, pricing["coupon_code"])
-            raise
-        finally:
-            con.close()
+                oid = cur.lastrowid
+                con.commit()
+                return oid
+            except Exception:
+                con.rollback()
+                if coupon_reserved:
+                    release_coupon_usage(i.guild.id, pricing["coupon_code"])
+                raise
+            finally:
+                con.close()
+
+        try:
+            oid = await asyncio.to_thread(insert_order)
+        except Exception as exc:
+            print(f"[PIX] pedido não salvo: {type(exc).__name__}: {exc}", flush=True)
+            await i.followup.send("⚠️ Não consegui salvar o pedido agora. Tente novamente.", ephemeral=True)
+            return
 
         if split or affiliate_split:
             print(
@@ -3248,13 +3341,18 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
             qr = data.get("qrcodeUrl") or ""
             q64 = data.get("qrCodeBase64") or ""
 
-            con = db()
-            con.execute(
-                "UPDATE orders SET transaction_id=?,pix_code=?,qr_url=?,updated_at=? WHERE id=?",
-                (tid, cp, qr, now_iso(), oid),
-            )
-            con.commit()
-            con.close()
+            def save_pix():
+                con = db()
+                try:
+                    con.execute(
+                        "UPDATE orders SET transaction_id=?,pix_code=?,qr_url=?,updated_at=? WHERE id=?",
+                        (tid, cp, qr, now_iso(), oid),
+                    )
+                    con.commit()
+                finally:
+                    con.close()
+
+            await asyncio.to_thread(save_pix)
 
             file = None
             if q64 and "," in q64:
@@ -3345,15 +3443,23 @@ class PayerModal(discord.ui.Modal, title="Dados para gerar o PIX"):
                 view=VerifyView(oid, self.uid),
             )
         except Exception as ex:
-            if coupon_reserved:
-                release_coupon_usage(i.guild.id, pricing["coupon_code"])
-            con = db()
-            con.execute(
-                "UPDATE orders SET status='falha',updated_at=? WHERE id=?",
-                (now_iso(), oid),
-            )
-            con.commit()
-            con.close()
+            def mark_pix_failure():
+                if coupon_reserved:
+                    release_coupon_usage(i.guild.id, pricing["coupon_code"])
+                con = db()
+                try:
+                    con.execute(
+                        "UPDATE orders SET status='falha',updated_at=? WHERE id=?",
+                        (now_iso(), oid),
+                    )
+                    con.commit()
+                finally:
+                    con.close()
+
+            try:
+                await asyncio.to_thread(mark_pix_failure)
+            except Exception as cleanup_exc:
+                print(f"[PIX] erro ao marcar falha pedido={oid}: {cleanup_exc}", flush=True)
             await i.followup.send(f"❌ Erro ao gerar PIX: `{str(ex)[:300]}`")
 
 
@@ -3387,10 +3493,16 @@ class VerifyView(discord.ui.View):
             )
             return
 
-        order = get_order(self.oid)
+        await i.response.defer(ephemeral=True, thinking=True)
+        try:
+            order = await _checkout_db_call(get_order, self.oid)
+        except Exception as exc:
+            print(f"[PIX] consulta ao copiar: {type(exc).__name__}: {exc}", flush=True)
+            await i.followup.send("⚠️ Não consegui consultar o PIX agora.", ephemeral=True)
+            return
         pix_code = str(order["pix_code"] or "").strip() if order else ""
         if not pix_code:
-            await i.response.send_message(
+            await i.followup.send(
                 "❌ O código PIX deste pedido não está disponível.",
                 ephemeral=True,
             )
@@ -3398,7 +3510,7 @@ class VerifyView(discord.ui.View):
 
         # Envia SOMENTE o payload original, sem ``` e sem qualquer caractere
         # extra. Isso evita o cliente copiar crases junto com o PIX.
-        await i.response.send_message(pix_code[:1900], ephemeral=True)
+        await i.followup.send(pix_code[:1900], ephemeral=True)
 
 
 async def process_subowner_payout(oid):

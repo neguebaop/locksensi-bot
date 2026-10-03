@@ -1,5 +1,5 @@
 import os, asyncio, json, io, random, string, traceback, re, time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import discord
@@ -410,6 +410,44 @@ def _start_menu_refresh(panel_id):
     return task
 
 
+async def _ack_store_interaction(interaction, action):
+    """Responde ao clique e registra se ele já chegou atrasado ao processo."""
+    age = (datetime.now(timezone.utc) - interaction.created_at).total_seconds()
+    started = time.monotonic()
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except discord.NotFound as exc:
+        if exc.code != 10062:
+            raise
+        print(
+            f"[INTERACAO EXPIRADA] acao={action} idade_antes={age:.2f}s "
+            f"tempo_resposta={time.monotonic() - started:.2f}s "
+            f"painel={str((interaction.data or {}).get('custom_id', ''))[:80]}",
+            flush=True,
+        )
+        return False
+    if age > 1.0 or time.monotonic() - started > 1.0:
+        print(
+            f"[INTERACAO LENTA] acao={action} idade_antes={age:.2f}s "
+            f"tempo_resposta={time.monotonic() - started:.2f}s",
+            flush=True,
+        )
+    return True
+
+
+async def monitor_event_loop_lag():
+    """Mostra no Render quando outra ação impede os botões de responder."""
+    loop = asyncio.get_running_loop()
+    last_report = 0.0
+    while not bot.is_closed():
+        started = loop.time()
+        await asyncio.sleep(0.5)
+        lag = loop.time() - started - 0.5
+        if lag > 0.8 and loop.time() - last_report > 5:
+            print(f"[LOOP ATRASADO] {lag:.2f}s sem processar interacoes", flush=True)
+            last_report = loop.time()
+
+
 class ProductBuyButton(discord.ui.Button):
     def __init__(self, product_id: int):
         super().__init__(
@@ -477,7 +515,8 @@ class PanelOptionsButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         # Confirma o clique imediatamente. Carregar os produtos consulta o banco
         # e, em hospedagens como Render, pode levar mais de 3 segundos.
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not await _ack_store_interaction(interaction, "opcoes"):
+            return
         try:
             cached = _cached_panel_products(self.panel_id)
             if cached is not None:
@@ -709,7 +748,8 @@ class PanelSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         # Confirma o clique ANTES de ler a seleção ou consultar o banco.
         # Assim qualquer erro posterior pode ser mostrado no próprio Discord.
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not await _ack_store_interaction(interaction, "produto"):
+            return
         try:
             values = (interaction.data or {}).get("values") or self.values
             if not values or values[0] == "none":
@@ -1417,6 +1457,7 @@ async def on_ready():
     if getattr(bot, "_startup_done", False):
         return
     bot._startup_done = True
+    bot._loop_watchdog_task = asyncio.create_task(monitor_event_loop_lag())
     bot.add_view(TicketPanelView())
     bot.add_view(CloseTicketView())
     bot._store_restore_task = asyncio.create_task(restore_store_views())
